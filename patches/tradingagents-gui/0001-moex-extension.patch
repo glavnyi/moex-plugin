@@ -1,0 +1,330 @@
+diff --git a/gui/app.py b/gui/app.py
+index 337f359..ae57dc3 100644
+--- a/gui/app.py
++++ b/gui/app.py
+@@ -69,6 +69,17 @@ ui_state  = UIStateStore()
+ app = Flask(__name__, template_folder="templates", static_folder="static")
+ CORS(app)
+ 
++# --- TradingAgents-MOEX extension routes (spec §9). Optional: the GUI
++# keeps its original behaviour when the extension is not installed.
++try:
++    from integration.gui_routes import register_routes as _register_moex_routes
++
++    _register_moex_routes(app)
++except Exception as _moex_exc:  # pragma: no cover - extension optional
++    logging.getLogger(__name__).warning(
++        "MOEX extension routes not loaded: %s", _moex_exc
++    )
++
+ 
+ # ---------------------------------------------------------------------------
+ # Page
+diff --git a/gui/run_manager.py b/gui/run_manager.py
+index 256b23e..27ff811 100644
+--- a/gui/run_manager.py
++++ b/gui/run_manager.py
+@@ -518,6 +518,15 @@ def _build_config(params: dict, default_config: dict) -> dict:
+     vendors = params.get("data_vendors") or {}
+     if isinstance(vendors, dict) and vendors:
+         cfg.setdefault("data_vendors", {}).update(vendors)
++    # --- TradingAgents-MOEX (spec §4): MOEX runs are routed through the
++    # MOEX vendors; non-MOEX configs are returned untouched.
++    if str(params.get("market") or "").upper() == "MOEX":
++        try:
++            from integration.config_adapter import enrich_run_config
++
++            cfg = enrich_run_config(params, cfg)
++        except Exception:  # extension absent → original behaviour preserved
++            pass
+     return cfg
+ 
+ 
+diff --git a/gui/templates/index.html b/gui/templates/index.html
+index 34e7967..f788b71 100644
+--- a/gui/templates/index.html
++++ b/gui/templates/index.html
+@@ -38,6 +38,12 @@
+     <button class="nav-btn" data-tab="setup" id="nav-setup">
+       <span class="nav-icon">🛠️</span><span>Setup</span>
+     </button>
++    <button class="nav-btn" data-tab="moex" id="nav-moex">
++      <span class="nav-icon">📊</span><span>MOEX</span>
++    </button>
++    <button class="nav-btn" data-tab="sandbox" id="nav-sandbox">
++      <span class="nav-icon">🏦</span><span>Песочница</span>
++    </button>
+   </nav>
+   <div class="sidebar-footer">
+     <div class="sidebar-footer-row">
+@@ -957,6 +963,263 @@ python -m gui.app</pre>
+     </div>
+   </div>
+ 
++  <!-- ═══════════ MOEX (TradingAgents-MOEX extension, spec §4/§7/§9) ═══════════ -->
++  <section class="tab-panel" id="tab-moex">
++    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;padding:20px;">
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">1</span>
++          <div>
++            <h2 class="form-card-title">Инструмент MOEX</h2>
++            <p class="form-card-sub">Поиск по SECID / ISIN / названию. Выбор заполняет тикер на вкладке Analyze.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div class="form-row tight">
++            <div class="form-group flex2">
++              <label for="moex-search">Запрос</label>
++              <input id="moex-search" type="text" class="input-lg" placeholder="SBER, Газпром, ISIN…" autocomplete="off">
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-primary" id="moex-search-btn">Найти</button>
++            </div>
++          </div>
++          <div id="moex-results" style="max-height:220px;overflow:auto;margin-top:8px"></div>
++          <div id="moex-quote" style="margin-top:10px"></div>
++        </div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">2</span>
++          <div>
++            <h2 class="form-card-title">Новости и источники</h2>
++            <p class="form-card-sub">MOEX RSS, ЦБ РФ, деловые СМИ, T-Invest MCP (§7). Один сбойный источник не блокирует остальные.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="moex-news-sources" style="max-height:230px;overflow:auto"></div>
++          <div class="form-row tight" style="margin-top:10px">
++            <div class="form-group flex1">
++              <label for="moex-news-sync">Синхронизация, сек</label>
++              <input id="moex-news-sync" type="number" min="60" step="60" placeholder="900">
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-ghost" id="moex-news-refresh">Обновить ленты</button>
++            </div>
++          </div>
++          <div id="moex-news-info" class="form-hint"></div>
++          <div id="moex-news-preview" style="margin-top:8px;font-size:12px;max-height:180px;overflow:auto"></div>
++          <div class="form-row tight" style="margin-top:10px">
++            <div class="form-group flex2">
++              <label for="moex-preview-ticker">Тикер для превью новостей</label>
++              <input id="moex-preview-ticker" type="text" placeholder="SBER" maxlength="20" autocomplete="off">
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-ghost" id="moex-news-preview-btn">Показать</button>
++            </div>
++          </div>
++          <pre id="moex-news-article" style="white-space:pre-wrap;font-size:12px;max-height:260px;overflow:auto"></pre>
++        </div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">3</span>
++          <div>
++            <h2 class="form-card-title">Лимиты риска (§6.3)</h2>
++            <p class="form-card-sub">Проверяются перед каждой заявкой в песочнице по актуальному состоянию счёта.</p>
++          </div>
++        </div>
++        <div class="form-card-body" id="risk-form">
++          <div class="form-row tight">
++            <div class="form-group flex1">
++              <label for="risk-max-order-amount">Макс. сумма сделки</label>
++              <input id="risk-max-order-amount" type="number" min="0" step="1000">
++            </div>
++            <div class="form-group flex1">
++              <label for="risk-max-position-pct">Макс. доля позиции, %</label>
++              <input id="risk-max-position-pct" type="number" min="0" max="100" step="1">
++            </div>
++          </div>
++          <div class="form-row tight">
++            <div class="form-group flex1">
++              <label for="risk-max-issuer-pct">Макс. доля эмитента, %</label>
++              <input id="risk-max-issuer-pct" type="number" min="0" max="100" step="1">
++            </div>
++            <div class="form-group flex1">
++              <label for="risk-max-open-orders">Макс. открытых заявок</label>
++              <input id="risk-max-open-orders" type="number" min="0" step="1">
++            </div>
++          </div>
++          <div class="form-row tight">
++            <div class="form-group flex1">
++              <label for="risk-max-risk-per-trade-pct">Риск на сделку, %</label>
++              <input id="risk-max-risk-per-trade-pct" type="number" min="0" max="100" step="0.5">
++            </div>
++            <div class="form-group flex1">
++              <label for="risk-daily-loss-limit">Дневной лимит потерь</label>
++              <input id="risk-daily-loss-limit" type="number" min="0" step="1000" placeholder="—">
++            </div>
++          </div>
++          <label style="display:flex;gap:8px;align-items:center;padding:4px 0">
++            <input type="checkbox" id="risk-allow-new-buys"> Разрешить новые покупки
++          </label>
++          <label style="display:flex;gap:8px;align-items:center;padding:4px 0">
++            <input type="checkbox" id="risk-allow-sell"> Разрешить продажу позиций
++          </label>
++          <button class="btn btn-primary" id="risk-save" style="margin-top:8px">Сохранить лимиты</button>
++        </div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">4</span>
++          <div>
++            <h2 class="form-card-title">Выводы по сделкам (§11)</h2>
++            <p class="form-card-sub">Учебный контекст из закрытых сделок. Можно отключить или удалить.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="moex-lessons"></div>
++        </div>
++      </div>
++
++    </div>
++  </section>
++
++  <!-- ═══════════ T-Invest SANDBOX (spec §5) ═══════════ -->
++  <section class="tab-panel" id="tab-sandbox">
++    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;padding:20px;">
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div id="ti-banner" class="form-card-body" style="opacity:.6">Проверяем подключение T-Invest…</div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">1</span>
++          <div>
++            <h2 class="form-card-title">Виртуальные счета</h2>
++            <p class="form-card-sub">Только песочница. Токен читается из окружения TINVEST_TOKEN и не сохраняется.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="ti-accounts"></div>
++          <div class="form-row tight" style="margin-top:10px">
++            <div class="form-group flex1">
++              <label for="ti-create-cur">Новый счёт, валюта</label>
++              <select id="ti-create-cur">
++                <option value="rub">RUB</option>
++                <option value="usd">USD</option>
++                <option value="hkd">HKD</option>
++              </select>
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-ghost" id="ti-create-btn">Создать счёт</button>
++            </div>
++          </div>
++          <div class="form-row tight" style="margin-top:8px">
++            <div class="form-group flex1">
++              <label for="ti-payin-amount">Пополнить (виртуально)</label>
++              <input id="ti-payin-amount" type="number" min="1" step="1000" placeholder="100000">
++            </div>
++            <div class="form-group flex1">
++              <label for="ti-payin-cur">Валюта</label>
++              <select id="ti-payin-cur">
++                <option value="rub">RUB</option>
++                <option value="usd">USD</option>
++              </select>
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-primary" id="ti-payin-btn">Пополнить</button>
++            </div>
++          </div>
++        </div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">2</span>
++          <div>
++            <h2 class="form-card-title">Портфель и синхронизация</h2>
++            <p class="form-card-sub">Баланс, позиции, средние цены и P&amp;L — из API брокера.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="ti-balance" class="form-hint">—</div>
++          <div id="ti-positions" style="margin-top:8px;max-height:240px;overflow:auto"></div>
++          <div style="display:flex;gap:10px;align-items:center;margin-top:10px">
++            <button class="btn btn-ghost" id="ti-sync-btn">Синхронизировать</button>
++            <span id="ti-sync-info" class="form-hint"></span>
++          </div>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">3</span>
++          <div>
++            <h2 class="form-card-title">Заявки в песочнице (§5.5)</h2>
++            <p class="form-card-sub">Превью → проверка риска → явное подтверждение. Размещение ≠ исполнение.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div class="form-row tight">
++            <div class="form-group flex2">
++              <label for="ord-ticker">Тикер</label>
++              <input id="ord-ticker" type="text" placeholder="SBER" maxlength="20" autocomplete="off">
++            </div>
++            <div class="form-group flex1">
++              <label for="ord-side">Сторона</label>
++              <select id="ord-side">
++                <option value="buy">Покупка</option>
++                <option value="sell">Продажа</option>
++              </select>
++            </div>
++            <div class="form-group flex1">
++              <label for="ord-type">Тип</label>
++              <select id="ord-type">
++                <option value="market">Рыночная</option>
++                <option value="limit">Лимитная</option>
++              </select>
++            </div>
++            <div class="form-group flex1">
++              <label for="ord-lots">Лоты</label>
++              <input id="ord-lots" type="number" min="1" step="1" placeholder="авто">
++            </div>
++            <div class="form-group flex1">
++              <label for="ord-price">Цена (для лимитной)</label>
++              <input id="ord-price" type="number" min="0" step="0.01" placeholder="—">
++            </div>
++          </div>
++          <div style="display:flex;gap:10px;margin-top:10px">
++            <button class="btn btn-ghost" id="ord-preview-btn">Превью заявки</button>
++            <button class="btn btn-primary" id="ord-place-btn" style="display:none">Подтвердить и отправить</button>
++          </div>
++          <div id="ord-preview" style="margin-top:10px"></div>
++          <h3 style="margin-top:16px;font-size:13px">Активные заявки</h3>
++          <div id="ti-orders" style="max-height:220px;overflow:auto"></div>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">4</span>
++          <div>
++            <h2 class="form-card-title">История операций</h2>
++            <p class="form-card-sub">Список операций виртуального счёта из T-Invest API.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="ti-ops" style="max-height:280px;overflow:auto"></div>
++        </div>
++      </div>
++
++    </div>
++  </section>
++
+ </main>
+ 
+ <!-- ═══════════════ TOAST ═══════════════ -->
+@@ -998,5 +1261,6 @@ python -m gui.app</pre>
+ <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+ <script src="/static/js/app.js"></script>
+ <script src="/static/js/app_v2.js"></script>
++<script src="/api/moex_ext.js"></script>
+ </body>
+ </html>

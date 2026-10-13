@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingagents-moex"
+version = "0.1.0"
+description = "TradingAgents-MOEX: MOEX market, Russian news sources and T-Invest sandbox integration for TradingAgents and TradingAgents-GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.32.4",
+    "pandas>=2.0.0",
+    "stockstats>=0.6.5",
+    "python-dateutil>=2.8.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+gui = ["flask>=3.0.0"]
+dev = ["pytest>=8.0", "pytest-mock>=3.12"]
+
+[tool.setuptools.packages.find]
+include = ["moex*", "tinvest*", "integration*", "scripts*"]
+
+[tool.setuptools.package-data]
+tinvest = ["certs/*.pem"]
+"moex.news" = ["adapters/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "unit: fast isolated unit tests",
+    "integration: tests that hit real external services",
+    "sandbox: tests that require a real T-Invest sandbox token",
+    "news: news adapter tests",
+    "regression: upstream regression tests",
+    "compatibility: patch/compatibility checks",
+]

@@ -1,0 +1,49 @@
+name: tradingagents-moex
+version: 0.1.0
+spec: 2.0
+
+pinned:
+  tradingagents:
+    repo: https://github.com/tauricresearch/tradingagents
+    commit: 1394a3f72aa4393e1a98f51b382434c4b4c2d972
+    version: v0.6.0
+    status: supported
+  TradingAgents-GUI:
+    repo: https://github.com/TheLocalLab/TradingAgents-GUI
+    commit: 774a0fa2aa3ee576d993ab2389e661a44ac9c37b
+    version: ""
+    status: supported
+
+projects:
+  tradingagents:
+    dir: upstream/tradingagents
+    patches:
+      - file: patches/tradingagents/0001-moex-market-cli.patch
+        description: CLI --market/--board flags; MOEX vendor wiring in run_analysis;
+          documented test-expectation updates for the new flag keys
+        files:
+          - cli/main.py
+          - cli/run.py
+          - tests/test_cli_commands.py
+          - tests/test_cli_headless.py
+  tradingagents-gui:
+    dir: upstream/TradingAgents-GUI
+    patches:
+      - file: patches/tradingagents-gui/0001-moex-extension.patch
+        description: extension route registration, MOEX config enrichment,
+          MOEX + Песочница tabs and market selector in the Analyze form
+        files:
+          - gui/app.py
+          - gui/run_manager.py
+          - gui/templates/index.html
+
+notes:
+  - "The GUI loads the extension dynamically (integration.gui_routes,
+     integration.config_adapter) — no new files are added inside either
+     upstream tree, so uninstalling restores byte-identical originals."
+  - "integration/ext.js is served by the extension at /api/moex_ext.js."
+  - "Patches must be re-validated with scripts/check_compatibility.py
+     against any commit other than the pinned ones (status = untested)."
+  - "tests/test_cli_commands.py and tests/test_cli_headless.py are patched
+     only to include the new market/board keys in the expected flags dict
+     (documented addition, spec 14.1); behaviour under test is unchanged."

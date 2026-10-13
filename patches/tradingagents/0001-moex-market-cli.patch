@@ -1,0 +1,92 @@
+diff --git a/cli/main.py b/cli/main.py
+index 7c13aca..c229809 100644
+--- a/cli/main.py
++++ b/cli/main.py
+@@ -64,6 +64,17 @@ def analyze(
+         None, "--html/--no-html",
+         help="Save the report as one HTML page too, complete_report.html, without asking (default: yes)",
+     ),
++    market: str = typer.Option(
++        "US",
++        "--market",
++        help="Market data source: US (default) or MOEX — MOEX requires the "
++             "TradingAgents-MOEX extension; other markets keep original behaviour",
++    ),
++    board: str = typer.Option(
++        None,
++        "--board",
++        help="MOEX trading board (e.g. TQBR); only used with --market MOEX",
++    ),
+ ):
+     """Run an analysis. This is what a bare `tradingagents` does.
+ 
+@@ -85,7 +96,8 @@ def analyze(
+             raise typer.Exit(code=1) from None
+ 
+     try:
+-        flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html}
++        flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html,
++                 "market": market, "board": board}
+         run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
+     except _NO_CONSOLE_ERRORS:
+         # A terminal with no console buffer cannot host the interactive prompts.
+diff --git a/cli/run.py b/cli/run.py
+index 77bf955..e8bec9b 100644
+--- a/cli/run.py
++++ b/cli/run.py
+@@ -111,6 +111,25 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
+ 
+     config = _build_run_config(selections, checkpoint)
+ 
++    # --- TradingAgents-MOEX (spec §4): route MOEX runs through the MOEX
++    # vendors. Non-MOEX runs keep the untouched original config.
++    if str(flags.get("market") or "").upper() == "MOEX":
++        try:
++            from integration.config_adapter import enrich_run_config
++            from integration.core_adapter import install as _install_moex_vendors
++
++            _install_moex_vendors()
++            config = enrich_run_config(
++                {
++                    "market": "MOEX",
++                    "ticker": flags.get("ticker") or selections.get("ticker") or "",
++                    "board": flags.get("board") or "",
++                },
++                config,
++            )
++        except Exception:  # extension absent → original behaviour preserved
++            pass
++
+     stats_handler = StatsCallbackHandler()
+ 
+     # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
+diff --git a/tests/test_cli_commands.py b/tests/test_cli_commands.py
+index 37c9c28..69481d4 100644
+--- a/tests/test_cli_commands.py
++++ b/tests/test_cli_commands.py
+@@ -25,7 +25,10 @@ calls: list = []
+ @pytest.mark.unit
+ def test_no_arguments_still_runs_an_analysis(runner):
+     assert runner.invoke(m.app, []).exit_code == 0
+-    no_flags = {"ticker": None, "date": None, "analysts": None, "save": None, "show": None, "html": None}
++    # documented addition (TradingAgents-MOEX): the CLI now also passes
++    # --market/--board so a run can be pinned to a non-US market.
++    no_flags = {"ticker": None, "date": None, "analysts": None, "save": None, "show": None,
++                "html": None, "market": "US", "board": None}
+     assert calls == [("analysis", {"checkpoint": None, "portfolio": None, "flags": no_flags})]
+ 
+ 
+diff --git a/tests/test_cli_headless.py b/tests/test_cli_headless.py
+index a800ecf..9119cef 100644
+--- a/tests/test_cli_headless.py
++++ b/tests/test_cli_headless.py
+@@ -155,7 +155,8 @@ def test_the_command_passes_its_flags_to_the_run(monkeypatch):
+                                                "--analysts", "market,news", "--save", "--no-show"])
+ 
+     assert result.exit_code == 0, result.output
+-    assert seen["flags"] == {**FLAGS, "html": None}
++    # documented addition (TradingAgents-MOEX): flags always carry market/board.
++    assert seen["flags"] == {**FLAGS, "html": None, "market": "US", "board": None}
+ 
+ 
+ @pytest.mark.unit
