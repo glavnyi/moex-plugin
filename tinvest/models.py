@@ -26,7 +26,7 @@ class Account:
     @classmethod
     def from_api(cls, data: dict) -> "Account":
         return cls(
-            id=data.get("accountId") or "",
+            id=data.get("id") or data.get("accountId") or "",
             name=data.get("name") or "",
             type=data.get("type") or "",
             status=data.get("status") or "",
@@ -132,6 +132,12 @@ class Order:
     @classmethod
     def from_api(cls, data: dict) -> "Order":
         executed = data.get("executedPrice") or data.get("averagePositionPrice")
+        # Sandbox v1 GetOrders often omits `price` for resting LIMIT orders
+        # and only echoes the limit price under executedPrice (live-verified)
+        # — mirror it so callers can show the working price.
+        price = data.get("price") or (
+            executed if "LIMIT" in str(data.get("orderType") or "") else None
+        )
         return cls(
             order_id=data.get("orderId") or "",
             client_order_id=data.get("clientId") or "",
@@ -141,7 +147,7 @@ class Order:
             status=data.get("executionReportStatus") or "",
             lots_requested=int(data.get("lotsRequested") or 0),
             lots_executed=int(data.get("lotsExecuted") or 0),
-            price=Money.from_api(data.get("price")),
+            price=Money.from_api(price),
             executed_price=Money.from_api(executed),
             message=data.get("message") or "",
             created_at=_iso(data.get("createdAt")),

@@ -1,8 +1,9 @@
 """Stop orders (spec §6.4) — native conditional orders of T-Invest API.
 
-Refused on production in this version. Native stop orders exist in the
-API (StopOrdersService); a gap-through stop is never guaranteed to fill
-at the stop price — callers must display that caveat (§6.4).
+Native stop orders live on StopOrdersService and exist for both venues;
+placement follows the §5.1 mode (``sandbox`` or ``live_trading``) and is
+refused on a read-only client. A gap-through stop is never guaranteed to
+fill at the stop price — callers must display that caveat (§6.4).
 """
 
 from __future__ import annotations
@@ -30,8 +31,7 @@ def post_stop_order(
     limit_price: float | None = None,
     client_order_id: str | None = None,
 ) -> dict:
-    if not client.sandbox:
-        raise TInvestError("post_stop_order is sandbox-only in this version")
+    client.require_mutation("post_stop_order")
     d = direction.lower()
     t = (order_type or "stop_loss").lower()
     if d not in _DIRECTIONS or t not in _TYPES:
@@ -44,6 +44,9 @@ def post_stop_order(
         "quantity": int(quantity_lots),
         "stopPrice": _quotation(float(stop_price)),
         "stopOrderType": _TYPES[t],
+        # PostStopOrder rejects payloads without expirationType
+        # ("Missing parameter: `expiration_type`", 30043 — live-verified).
+        "expirationType": "STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL",
         "clientId": cid,
     }
     if limit_price is not None:
@@ -60,7 +63,8 @@ def post_stop_order(
         "type": t,
         "stop_price": stop_price,
         "quantity_lots": int(quantity_lots),
-        "sandbox": True,
+        "sandbox": client.sandbox,
+        "mode": client.mode,
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "caveat": "программная/нативная стоп-заявка не гарантирует исполнение "
                   "по цене стопа при гэпе или остановке торгов (spec §6.4)",
@@ -75,6 +79,7 @@ def list_stop_orders(client: TInvestClient, account_id: str) -> list[dict]:
 
 def cancel_stop_order(client: TInvestClient, account_id: str,
                       stop_order_id: str) -> dict:
+    client.require_mutation("cancel_stop_order")
     client.call("StopOrdersService", "CancelStopOrder",
                 {"accountId": account_id, "stopOrderId": stop_order_id})
     return {"stop_order_id": stop_order_id, "status": "CANCEL_REQUESTED"}

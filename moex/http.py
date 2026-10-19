@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -72,7 +73,10 @@ def cache_put(key: str, data: Any) -> None:
     path = _cache_path(key)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        # Unique tmp per writer: GUI, backtest and probes share this cache
+        # directory, and two processes writing the same .tmp path could
+        # interleave into one corrupt publish.
+        tmp = path.with_name(f"{path.stem}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
         tmp.write_text(
             json.dumps({"ts": time.time(), "data": data}, ensure_ascii=False),
             encoding="utf-8",

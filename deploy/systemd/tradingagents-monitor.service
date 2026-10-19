@@ -1,0 +1,12 @@
+[Unit]
+Description=TradingAgents-MOEX auto-trading bug sweep (one report per run)
+After=network.target tradingagents-gui.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/boris/TRADINGAGENTS MOEX
+ExecStart=/bin/bash "/home/boris/TRADINGAGENTS MOEX/scripts/monitor_autotrade_run.sh"
+# A sweep that finds bugs exits 1 — that is a report, not a failure of the
+# timer. Only exit 2 (the monitor itself broke) should look unhealthy.
+SuccessExitStatus=0 1
+Environment=PYTHONUNBUFFERED=1

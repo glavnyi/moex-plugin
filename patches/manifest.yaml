@@ -5,8 +5,8 @@ spec: 2.0
 pinned:
   tradingagents:
     repo: https://github.com/tauricresearch/tradingagents
-    commit: 1394a3f72aa4393e1a98f51b382434c4b4c2d972
-    version: v0.6.0
+    commit: e8f5503e9b86d5c2710b0c76b1f686703968c9df
+    version: v0.7.0
     status: supported
   TradingAgents-GUI:
     repo: https://github.com/TheLocalLab/TradingAgents-GUI
@@ -31,11 +31,20 @@ projects:
     patches:
       - file: patches/tradingagents-gui/0001-moex-extension.patch
         description: extension route registration, MOEX config enrichment,
-          MOEX + Песочница tabs and market selector in the Analyze form
+          MOEX + Песочница + Авторежим tabs, §5.1 mode selector and market
+          selector in the Analyze form, market-aware sentiment analyst prompt
         files:
           - gui/app.py
           - gui/run_manager.py
+          - gui/static/js/app_v2.js
           - gui/templates/index.html
+          - tradingagents/agents/analysts/fundamentals_analyst.py
+          - tradingagents/agents/analysts/market_analyst.py
+          - tradingagents/agents/analysts/news_analyst.py
+          - tradingagents/agents/analysts/sentiment_analyst.py
+          - tradingagents/agents/schemas.py
+          - tradingagents/agents/utils/memory.py
+          - tradingagents/llm_clients/openai_client.py
 
 notes:
   - "The GUI loads the extension dynamically (integration.gui_routes,

@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Pinned SHAs — must match patches/manifest.yaml «supported_upstream».
 PINNED = {
-    "tradingagents": "1394a3f72aa4393e1a98f51b382434c4b4c2d972",
+    "tradingagents": "e8f5503e9b86d5c2710b0c76b1f686703968c9df",
     "TradingAgents-GUI": "774a0fa2aa3ee576d993ab2389e661a44ac9c37b",
 }
 

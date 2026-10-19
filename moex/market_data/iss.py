@@ -56,12 +56,14 @@ def get_candles(
     market: str | None = None,
     board: str | None = None,
 ) -> pd.DataFrame:
-    """Historical candles as a DataFrame indexed by day/instant.
+    """Historical candles as a DataFrame with a day-normalized ``Date``.
 
     ``start_date`` / ``end_date`` are inclusive YYYY-MM-DD strings. Only
     data published on or before ``end_date`` is returned (point-in-time
     correct: MOEX candles are finalized end-of-day and the request window
-    is bounded).
+    is bounded). Daily intervals are the supported case: ``Date`` is
+    normalized to the calendar day, so intraday intervals would collapse
+    to one row per day — nobody in this codebase requests them.
     """
     instrument = _instrument(target, market=market, board=board)
     engine, market_name, board_id = _board_paths(instrument)

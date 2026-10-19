@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the TradingAgents-MOEX auto-trading bug sweep every hour
+
+[Timer]
+OnCalendar=hourly
+# Catch up after downtime: a reboot must not silently lose an hour of eyes.
+Persistent=true
+AccuracySec=1min
+Unit=tradingagents-monitor.service
+
+[Install]
+WantedBy=timers.target

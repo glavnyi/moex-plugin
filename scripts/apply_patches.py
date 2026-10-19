@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tradingagents_root:
         overrides["tradingagents"] = args.tradingagents_root
     if args.gui_root:
-        overrides["TradingAgents-GUI"] = args.gui_root
+        overrides["tradingagents-gui"] = args.gui_root
     results = apply_all(None, REPO_ROOT, overrides, force=args.force)
     bad = {k: v for k, v in results.items()
            if v not in ("applied", "already-applied")}

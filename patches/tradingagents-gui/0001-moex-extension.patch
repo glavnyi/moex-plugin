@@ -21,7 +21,7 @@ index 337f359..ae57dc3 100644
  # ---------------------------------------------------------------------------
  # Page
 diff --git a/gui/run_manager.py b/gui/run_manager.py
-index 256b23e..27ff811 100644
+index 256b23e..3369d77 100644
 --- a/gui/run_manager.py
 +++ b/gui/run_manager.py
 @@ -518,6 +518,15 @@ def _build_config(params: dict, default_config: dict) -> dict:
@@ -40,11 +40,74 @@ index 256b23e..27ff811 100644
      return cfg
  
  
+@@ -535,14 +544,31 @@ def _handle_node_chunk(run: Run, node_name: str, state: Any,
+                       "status": "completed", "agents": dict(run.roster)})
+         _advance_in_progress(run, agent_display)
+ 
+-    # Tool-only nodes: count the tool call, skip report extraction.
++    # Tool-call counting: every node state carries the full accumulated
++    # message history, so count each unique tool call only once (dedup by
++    # call id, falling back to name+args). Previously only tools_* nodes
++    # were scanned, which missed inline analyst tool calls entirely.
++    if isinstance(state, dict):
++        seen = getattr(run, "_seen_tool_call_ids", None)
++        if seen is None:
++            seen = run._seen_tool_call_ids = set()
++        for msg in _iter_messages(state.get("messages")):
++            for tc in getattr(msg, "tool_calls", None) or []:
++                if isinstance(tc, dict):
++                    name = tc.get("name", "?")
++                    key = str(tc.get("id") or f"{name}:{str(tc.get('args'))[:160]}")
++                else:
++                    name = getattr(tc, "name", "?")
++                    key = str(getattr(tc, "id", None) or
++                              f"{name}:{str(getattr(tc, 'args', ''))[:160]}")
++                if key in seen:
++                    continue
++                seen.add(key)
++                run.stats["tool_calls"] += 1
++                run.emit({"type": "tool_call", "tool": str(name), "node": node_name})
++
++    # Tool-only nodes: skip report extraction.
+     if node_name.startswith("tools_"):
+-        if isinstance(state, dict):
+-            for msg in _iter_messages(state.get("messages")):
+-                for tc in getattr(msg, "tool_calls", None) or []:
+-                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "?")
+-                    run.stats["tool_calls"] += 1
+-                    run.emit({"type": "tool_call", "tool": str(name), "node": node_name})
+         return
+ 
+     if not isinstance(state, dict):
+diff --git a/gui/static/js/app_v2.js b/gui/static/js/app_v2.js
+index 42a13c0..d294b4c 100644
+--- a/gui/static/js/app_v2.js
++++ b/gui/static/js/app_v2.js
+@@ -842,6 +842,19 @@
+     reader.querySelectorAll("h2, h3").forEach(h => {
+       h.id = `section-${++n}`;
+     });
++    // Report → sandbox order bridge (wired by ext.js taProposeOrder).
++    const cta = document.createElement("div");
++    cta.style.cssText =
++      "margin:14px 0;padding:10px 12px;border:1px dashed var(--border,#444);border-radius:8px";
++    cta.innerHTML =
++      "<button class='btn btn-ghost' id='report-propose-btn'>💡 Заявка из этого отчёта (песочница)</button> " +
++      "<span class='form-hint'>Разбор BUY/SELL/HOLD → превью с проверкой риска. " +
++      "Ничего не отправляется без вашего подтверждения.</span>";
++    reader.appendChild(cta);
++    cta.querySelector("button").onclick = () => {
++      if (window.taProposeOrder) window.taProposeOrder(window._currentReport);
++      else window.showToast?.("Модуль заявок не загружен (ext.js)", "error");
++    };
+   }
+ 
+   function renderReportTOC(markdown) {
 diff --git a/gui/templates/index.html b/gui/templates/index.html
-index 34e7967..f788b71 100644
+index 34e7967..8e05692 100644
 --- a/gui/templates/index.html
 +++ b/gui/templates/index.html
-@@ -38,6 +38,12 @@
+@@ -38,6 +38,15 @@
      <button class="nav-btn" data-tab="setup" id="nav-setup">
        <span class="nav-icon">🛠️</span><span>Setup</span>
      </button>
@@ -54,10 +117,13 @@ index 34e7967..f788b71 100644
 +    <button class="nav-btn" data-tab="sandbox" id="nav-sandbox">
 +      <span class="nav-icon">🏦</span><span>Песочница</span>
 +    </button>
++    <button class="nav-btn" data-tab="autotrade" id="nav-autotrade">
++      <span class="nav-icon">🤖</span><span>Авто</span>
++    </button>
    </nav>
    <div class="sidebar-footer">
      <div class="sidebar-footer-row">
-@@ -957,6 +963,263 @@ python -m gui.app</pre>
+@@ -957,6 +966,520 @@ python -m gui.app</pre>
      </div>
    </div>
  
@@ -167,6 +233,12 @@ index 34e7967..f788b71 100644
 +          <label style="display:flex;gap:8px;align-items:center;padding:4px 0">
 +            <input type="checkbox" id="risk-allow-sell"> Разрешить продажу позиций
 +          </label>
++          <label style="display:flex;gap:8px;align-items:center;padding:4px 0" title="Без этого каждая заявка требует явного подтверждения в UI (§13)">
++            <input type="checkbox" id="risk-require-confirmation"> Требовать подтверждение каждой заявки
++          </label>
++          <label style="display:flex;gap:8px;align-items:center;padding:4px 0" title="Только SANDBOX: пропускать шаг подтверждения после превью (§13)">
++            <input type="checkbox" id="risk-sandbox-auto-confirm"> Sandbox: авто-подтверждение после превью
++          </label>
 +          <button class="btn btn-primary" id="risk-save" style="margin-top:8px">Сохранить лимиты</button>
 +        </div>
 +      </div>
@@ -187,6 +259,188 @@ index 34e7967..f788b71 100644
 +    </div>
 +  </section>
 +
++  <!-- ═══════════ §5.1 modes + scheduled auto-trading ═══════════ -->
++  <section class="tab-panel" id="tab-autotrade">
++    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;padding:20px;">
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">1</span>
++          <div>
++            <h2 class="form-card-title">Режим подключения (§5.1)</h2>
++            <p class="form-card-sub">Один селектор на весь проект: к какой площадке идёт каждый запрос к брокеру. Токен — только из окружения.</p>
++          </div>
++          <span style="flex:1"></span>
++          <span class="badge" id="at-mode-env" style="align-self:center">—</span>
++        </div>
++        <div class="form-card-body">
++          <div class="form-row tight">
++            <div class="form-group flex1">
++              <label for="at-mode">Режим</label>
++              <select id="at-mode">
++                <option value="disabled">1. Отключено</option>
++                <option value="readonly">2. Только чтение</option>
++                <option value="sandbox">3. Песочница</option>
++                <option value="live_readonly">4. Боевой, только чтение</option>
++                <option value="live_trading">5. Реальная торговля</option>
++              </select>
++            </div>
++            <div class="form-group flex1" style="align-self:end">
++              <button class="btn btn-primary" id="at-mode-save">Применить режим</button>
++            </div>
++          </div>
++          <p class="form-hint" id="at-mode-desc">—</p>
++          <label class="at-check" id="at-mode-confirm-wrap" style="display:none">
++            <input type="checkbox" id="at-mode-confirm-live">
++            Понимаю: режим 5 шлёт заявки на боевой счёт настоящими деньгами
++          </label>
++          <p class="form-hint" id="at-mode-status"></p>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">2</span>
++          <div>
++            <h2 class="form-card-title">Авторежим</h2>
++            <p class="form-card-sub">По расписанию: анализ → риск-гейт → заявка → журнал → синк. По умолчанию выключен во всех окружениях.</p>
++          </div>
++          <span style="flex:1"></span>
++          <span class="badge" id="at-state" style="align-self:center">—</span>
++        </div>
++        <div class="form-card-body">
++          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px">
++            <label class="at-check"><input type="checkbox" id="at-enabled"> Авторежим включён</label>
++            <div class="form-group">
++              <label for="at-env">Окружение</label>
++              <select id="at-env">
++                <option value="sandbox">sandbox — виртуальный счёт</option>
++                <option value="live">live — боевой счёт</option>
++              </select>
++            </div>
++            <div class="form-group">
++              <label for="at-tick">Пауза между циклами, с</label>
++              <input id="at-tick" type="number" min="60" step="30">
++            </div>
++            <div class="form-group">
++              <label for="at-watch">Набор тикеров (через запятую)</label>
++              <input id="at-watch" type="text" placeholder="SBER, GAZP">
++            </div>
++            <div class="form-group">
++              <label for="at-maxorders">Заявок в день</label>
++              <input id="at-maxorders" type="number" min="0" step="1">
++            </div>
++            <div class="form-group">
++              <label for="at-maxpos">Открытых позиций</label>
++              <input id="at-maxpos" type="number" min="0" step="1">
++            </div>
++            <label class="at-check"><input type="checkbox" id="at-markethours"> Только в часы торгов</label>
++            <label class="at-check"><input type="checkbox" id="at-skipholding"> Не добирать существующую позицию</label>
++            <label class="at-check"><input type="checkbox" id="at-kill"> Аварийный стоп (kill switch)</label>
++          </div>
++
++          <label class="at-check" id="at-liveconf-wrap" style="display:none">
++            <input type="checkbox" id="at-liveconf">
++            Подтверждаю: в окружении live заявки уходят на реальный счёт
++          </label>
++          <p class="form-hint" id="at-livehint">Для live нужны три отдельных разрешения: tinvest.mode=live_trading, этот флажок и снятие risk.automation_sandbox_only в рисках.</p>
++
++          <div class="form-row tight" style="margin-top:12px">
++            <button class="btn btn-primary" id="at-save">Сохранить</button>
++            <button class="btn btn-ghost" id="at-run">Запустить цикл сейчас</button>
++            <button class="btn btn-ghost" id="at-refresh">Обновить статус</button>
++          </div>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">3</span>
++          <div>
++            <h2 class="form-card-title">Скринер (автоотбор тикеров)</h2>
++            <p class="form-card-sub">Ручной ввод не требуется: сканируется весь борд TQBR, фильтры по ликвидности, спреду, цене и листингу, ранжирование по обороту. В TradingAgents уходит не больше «кандидатов в день»; решения и заявки идут через те же риск-гейты, что и вручную.</p>
++          </div>
++          <span style="flex:1"></span>
++          <span class="badge" id="at-scr-state" style="align-self:center">—</span>
++        </div>
++        <div class="form-card-body">
++          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px">
++            <label class="at-check"><input type="checkbox" id="at-screener"> Скринер включён</label>
++            <div class="form-group">
++              <label for="at-scr-turnover">Мин. оборот за день, ₽</label>
++              <input id="at-scr-turnover" type="number" min="0" step="100000">
++            </div>
++            <div class="form-group">
++              <label for="at-scr-spread">Макс. спред, %</label>
++              <input id="at-scr-spread" type="number" min="0" step="0.1">
++            </div>
++            <div class="form-group">
++              <label for="at-scr-price">Мин. цена, ₽</label>
++              <input id="at-scr-price" type="number" min="0" step="0.5">
++            </div>
++            <div class="form-group">
++              <label for="at-scr-cap">Кандидатов в день (бюджет анализов)</label>
++              <input id="at-scr-cap" type="number" min="1" step="1">
++            </div>
++            <div class="form-group">
++              <label for="at-scr-exclude">Стоп-лист (через запятую)</label>
++              <input id="at-scr-exclude" type="text" placeholder="TATN, ROSN">
++            </div>
++          </div>
++          <div id="at-scr-kpi" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:14px"></div>
++          <div style="margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px">
++            <div>
++              <h3 style="font-size:13px">Отклонено по причинам (последний скан)</h3>
++              <div id="at-scr-rejects" class="form-hint">—</div>
++            </div>
++            <div>
++              <h3 style="font-size:13px">Кандидаты</h3>
++              <div id="at-scr-candidates" style="max-height:200px;overflow:auto;font-size:12px">—</div>
++            </div>
++          </div>
++          <div style="margin-top:14px">
++            <h3 style="font-size:13px">Заявки за день (журнал + статусы)</h3>
++            <div id="at-orders" style="max-height:220px;overflow:auto;font-size:12px">—</div>
++          </div>
++          <div class="form-row tight" style="margin-top:12px">
++            <button class="btn btn-ghost" id="at-scr-preview">Показать кандидатов сейчас</button>
++          </div>
++          <p class="form-hint">Лимит «Заявок в день» действует суммарно по всем тикерам, считается по московскому дню и переживает перезапуск. Закрытия позиций и защитные заявки (стоп-лосс/тейк-профит) лимитом не блокируются — открытая позиция никогда не остаётся без защиты.</p>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">4</span>
++          <div>
++            <h2 class="form-card-title">Проверки перед циклом</h2>
++            <p class="form-card-sub">Пока хоть один гейт не «пройден», заявка не отправляется — даже при ручном запуске.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div id="at-gates"></div>
++          <div id="at-cycle" class="form-hint" style="margin-top:10px">—</div>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">5</span>
++          <div>
++            <h2 class="form-card-title">Журнал</h2>
++            <p class="form-card-sub">append-only: решение, заявка, отказ, смена режима — по московскому дню.</p>
++          </div>
++          <span style="flex:1"></span>
++          <button class="btn btn-ghost" id="at-log-refresh">Обновить</button>
++        </div>
++        <div class="form-card-body">
++          <div id="at-log" style="max-height:320px;overflow:auto;font-family:var(--font-mono,monospace);font-size:12px"></div>
++        </div>
++      </div>
++
++    </div>
++  </section>
++
 +  <!-- ═══════════ T-Invest SANDBOX (spec §5) ═══════════ -->
 +  <section class="tab-panel" id="tab-sandbox">
 +    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;padding:20px;">
@@ -195,9 +449,33 @@ index 34e7967..f788b71 100644
 +        <div id="ti-banner" class="form-card-body" style="opacity:.6">Проверяем подключение T-Invest…</div>
 +      </div>
 +
-+      <div class="form-card">
++      <div class="form-card" style="grid-column:1/-1">
 +        <div class="form-card-head">
 +          <span class="form-card-num">1</span>
++          <div>
++            <h2 class="form-card-title">Дашборд</h2>
++            <p class="form-card-sub">Баланс счёта, открытые позиции, закрытые сделки и P&amp;L за день / неделю / месяц / всё время.</p>
++          </div>
++          <span style="flex:1"></span>
++          <button class="btn btn-ghost" id="ti-dash-refresh">Обновить</button>
++        </div>
++        <div class="form-card-body">
++          <div id="ti-dash-kpi" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px"></div>
++          <div style="margin-top:14px">
++            <h3 style="font-size:13px">Открытые позиции</h3>
++            <div id="ti-dash-positions"></div>
++          </div>
++          <div style="margin-top:14px">
++            <h3 style="font-size:13px">Закрытые сделки</h3>
++            <div id="ti-dash-deals" style="max-height:260px;overflow:auto"></div>
++          </div>
++          <div id="ti-dash-foot" class="form-hint" style="margin-top:8px"></div>
++        </div>
++      </div>
++
++      <div class="form-card">
++        <div class="form-card-head">
++          <span class="form-card-num">2</span>
 +          <div>
 +            <h2 class="form-card-title">Виртуальные счета</h2>
 +            <p class="form-card-sub">Только песочница. Токен читается из окружения TINVEST_TOKEN и не сохраняется.</p>
@@ -239,7 +517,7 @@ index 34e7967..f788b71 100644
 +
 +      <div class="form-card">
 +        <div class="form-card-head">
-+          <span class="form-card-num">2</span>
++          <span class="form-card-num">3</span>
 +          <div>
 +            <h2 class="form-card-title">Портфель и синхронизация</h2>
 +            <p class="form-card-sub">Баланс, позиции, средние цены и P&amp;L — из API брокера.</p>
@@ -257,7 +535,7 @@ index 34e7967..f788b71 100644
 +
 +      <div class="form-card" style="grid-column:1/-1">
 +        <div class="form-card-head">
-+          <span class="form-card-num">3</span>
++          <span class="form-card-num">4</span>
 +          <div>
 +            <h2 class="form-card-title">Заявки в песочнице (§5.5)</h2>
 +            <p class="form-card-sub">Превью → проверка риска → явное подтверждение. Размещение ≠ исполнение.</p>
@@ -304,7 +582,52 @@ index 34e7967..f788b71 100644
 +
 +      <div class="form-card" style="grid-column:1/-1">
 +        <div class="form-card-head">
-+          <span class="form-card-num">4</span>
++          <span class="form-card-num">5</span>
++          <div>
++            <h2 class="form-card-title">Стоп-заявки (§6.4)</h2>
++            <p class="form-card-sub">Нативные стоп-заявки T-Invest. Не гарантируют исполнение по цене стопа при гэпе или остановке торгов.</p>
++          </div>
++        </div>
++        <div class="form-card-body">
++          <div class="form-row tight">
++            <div class="form-group flex1">
++              <label for="stop-ticker">Тикер</label>
++              <input id="stop-ticker" type="text" placeholder="SBER" maxlength="20" autocomplete="off">
++            </div>
++            <div class="form-group flex1">
++              <label for="stop-direction">Направление</label>
++              <select id="stop-direction">
++                <option value="sell">Продажа (стоп-лосс по лонгу)</option>
++                <option value="buy">Покупка (стоп-лосс по шорту)</option>
++              </select>
++            </div>
++            <div class="form-group flex1">
++              <label for="stop-type">Тип</label>
++              <select id="stop-type">
++                <option value="stop_loss">Stop-loss</option>
++                <option value="take_profit">Take-profit</option>
++              </select>
++            </div>
++            <div class="form-group flex1">
++              <label for="stop-lots">Лоты</label>
++              <input id="stop-lots" type="number" min="1" step="1" placeholder="вся позиция">
++            </div>
++            <div class="form-group flex1">
++              <label for="stop-price">Стоп-цена</label>
++              <input id="stop-price" type="number" min="0.01" step="0.01" placeholder="270">
++            </div>
++          </div>
++          <div style="display:flex;gap:10px;margin-top:10px">
++            <button class="btn btn-ghost" id="stop-place-btn">Поставить стоп-заявку</button>
++          </div>
++          <h3 style="margin-top:16px;font-size:13px">Активные стоп-заявки</h3>
++          <div id="ti-stops" style="max-height:200px;overflow:auto"></div>
++        </div>
++      </div>
++
++      <div class="form-card" style="grid-column:1/-1">
++        <div class="form-card-head">
++          <span class="form-card-num">6</span>
 +          <div>
 +            <h2 class="form-card-title">История операций</h2>
 +            <p class="form-card-sub">Список операций виртуального счёта из T-Invest API.</p>
@@ -321,10 +644,419 @@ index 34e7967..f788b71 100644
  </main>
  
  <!-- ═══════════════ TOAST ═══════════════ -->
-@@ -998,5 +1261,6 @@ python -m gui.app</pre>
+@@ -998,5 +1521,6 @@ python -m gui.app</pre>
  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
  <script src="/static/js/app.js"></script>
  <script src="/static/js/app_v2.js"></script>
 +<script src="/api/moex_ext.js"></script>
  </body>
  </html>
+diff --git a/tradingagents/agents/analysts/fundamentals_analyst.py b/tradingagents/agents/analysts/fundamentals_analyst.py
+index de50ec8..85c7e4c 100644
+--- a/tradingagents/agents/analysts/fundamentals_analyst.py
++++ b/tradingagents/agents/analysts/fundamentals_analyst.py
+@@ -28,9 +28,18 @@ def create_fundamentals_analyst(llm):
+             "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+             + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
+             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
+-            + get_language_instruction() + get_brevity_instruction(),
++            + get_language_instruction() + get_brevity_instruction()
+         )
+ 
++        _snap = str((get_config() or {}).get("moex_data_snapshot") or "")
++        if _snap:
++            system_message += (
++                "\n\n## Pre-fetched real market data (MOEX ISS)"
++                "\nAll figures below are REAL. Base your analysis on them and"
++                " never invent prices, dates or indicator values that are not"
++                " present here or returned by your tools.\n" + _snap
++            )
++
+         prompt = ChatPromptTemplate.from_messages(
+             [
+                 (
+diff --git a/tradingagents/agents/analysts/market_analyst.py b/tradingagents/agents/analysts/market_analyst.py
+index 00c24bd..66635a1 100644
+--- a/tradingagents/agents/analysts/market_analyst.py
++++ b/tradingagents/agents/analysts/market_analyst.py
+@@ -50,6 +50,15 @@ Volume-Based Indicators:
+             + get_language_instruction() + get_brevity_instruction()
+         )
+ 
++        _snap = str((get_config() or {}).get("moex_data_snapshot") or "")
++        if _snap:
++            system_message += (
++                "\n\n## Pre-fetched real market data (MOEX ISS)"
++                "\nAll figures below are REAL. Base your analysis on them and"
++                " never invent prices, dates or indicator values that are not"
++                " present here or returned by your tools.\n" + _snap
++            )
++
+         prompt = ChatPromptTemplate.from_messages(
+             [
+                 (
+diff --git a/tradingagents/agents/analysts/news_analyst.py b/tradingagents/agents/analysts/news_analyst.py
+index 665155b..482b28f 100644
+--- a/tradingagents/agents/analysts/news_analyst.py
++++ b/tradingagents/agents/analysts/news_analyst.py
+@@ -25,6 +25,15 @@ def create_news_analyst(llm):
+             + get_language_instruction() + get_brevity_instruction()
+         )
+ 
++        _snap = str((get_config() or {}).get("moex_data_snapshot") or "")
++        if _snap:
++            system_message += (
++                "\n\n## Pre-fetched real market data (MOEX ISS)"
++                "\nAll figures below are REAL. Base your analysis on them and"
++                " never invent prices, dates or indicator values that are not"
++                " present here or returned by your tools.\n" + _snap
++            )
++
+         prompt = ChatPromptTemplate.from_messages(
+             [
+                 (
+diff --git a/tradingagents/agents/analysts/sentiment_analyst.py b/tradingagents/agents/analysts/sentiment_analyst.py
+index cd2d446..6c1028c 100644
+--- a/tradingagents/agents/analysts/sentiment_analyst.py
++++ b/tradingagents/agents/analysts/sentiment_analyst.py
+@@ -36,6 +36,16 @@ def _seven_days_back(trade_date: str) -> str:
+     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+ 
+ 
++def _active_market() -> str:
++    """Market of the current run (``MOEX`` / ``US``), empty when unknown."""
++    try:
++        from tradingagents.dataflows.config import get_config  # vendored copy
++
++        return str((get_config() or {}).get("market") or "").upper()
++    except Exception:  # pragma: no cover - config is always present in the GUI
++        return ""
++
++
+ def create_sentiment_analyst(llm):
+     """Create a sentiment analyst node for the trading graph.
+ 
+@@ -73,6 +83,7 @@ def create_sentiment_analyst(llm):
+             news_block=news_block,
+             stocktwits_block=stocktwits_block,
+             reddit_block=reddit_block,
++            market=_active_market(),
+         )
+ 
+         prompt = ChatPromptTemplate.from_messages(
+@@ -114,13 +125,69 @@ def _build_system_message(
+     news_block: str,
+     stocktwits_block: str,
+     reddit_block: str,
++    market: str = "",
+ ) -> str:
+-    """Assemble the sentiment-analyst system message with structured data blocks."""
+-    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
++    """Assemble the sentiment-analyst system message with structured data blocks.
+ 
+-## Data sources (pre-fetched, in this prompt)
++    ``market`` selects the wording. StockTwits indexes US cashtags and the
++    three subreddits carry no MOEX tickers, so on a MOEX run both social
++    blocks are empty placeholders — the prompt must say so and must stop
++    asking for a Bullish/Bearish ratio the model can never have, otherwise
++    it fills the gap with invented posts.
++    """
++    moex = str(market or "").upper() == "MOEX"
++    news_source = "MOEX (ISS and exchange RSS feeds)" if moex else "Yahoo Finance"
++    coverage = (
++        "the available data sources that have already been collected for you."
++        if moex
++        else "three complementary data sources that have already been collected for you."
++    )
++
++    if moex:
++        sources = f"""### News headlines — {news_source}, past 7 days
++Institutional and regulatory framing: exchange notices, wire services, issuer disclosures. Fact-driven, slower-moving signal.
++
++<start_of_news>
++{news_block}
++<end_of_news>
++
++### StockTwits messages — not applicable to MOEX-quoted instruments
++StockTwits indexes US cashtags only, so for a Moscow Exchange ticker this block is a fetch placeholder and carries no sentiment.
++
++<start_of_stocktwits>
++{stocktwits_block}
++<end_of_stocktwits>
++
++### Reddit posts — not applicable to MOEX-quoted instruments
++The r/wallstreetbets, r/stocks and r/investing feeds do not cover MOEX tickers; this block is a fetch placeholder only.
++
++<start_of_reddit>
++{reddit_block}
++<end_of_reddit>"""
++
++        analysis = """1. **There is no retail social feed for this instrument.** Both social blocks are empty placeholders by design. Do not read, estimate or invent a StockTwits Bullish/Bearish ratio, upvote counts or subreddit mood, and never report the absence of posts as a sentiment signal.
++
++2. **Read news tone by source type.** An exchange notice (tender offer, coupon or board decision, disclosure of a material fact) is an event with regulatory weight; wire or analyst commentary is opinion. Weight events above opinion.
++
++3. **Cross-check the news against price and volume.** The Market Analyst report carries the current candles and turnover: if the news flow is constructive but price and volume disagree, state that divergence rather than resolving it.
+ 
+-### News headlines — Yahoo Finance, past 7 days
++4. **Distinguish opinion from event.** A headline ("Sberbank lifts its dividend guidance") is an event; a column arguing the share is expensive is opinion. Both are inputs but should be weighted differently in your conclusions.
++
++5. **Identify recurring narrative themes.** What topic keeps coming up in the news flow? That's the dominant narrative driving current sentiment.
++
++6. **Be honest about data limits.** If the news block is thin, or a source returned an "<unavailable>" placeholder, flag the caveat explicitly and say that no retail-sentiment signal exists for this instrument.
++
++7. **Identify catalysts and risks** that emerge from the news — coupon and dividend dates, board and regulator decisions, macro headlines, etc.
++
++8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call."""
++
++        output = """1. **Overall sentiment direction** — Bullish / Bearish / Neutral / Mixed — with a brief confidence note based on data quality and sample size.
++2. **Source-by-source breakdown** — what the news flow is telling you, with specific evidence (cite headline counts, dates, notable notices), and state explicitly that social sources are out of scope for MOEX.
++3. **Divergences, alignments, and key narratives** across the news flow and the Market Analyst's price and volume view.
++4. **Catalysts and risks** surfaced by the data.
++5. **Markdown table** at the end summarizing key sentiment signals, their direction, source, and supporting evidence."""
++    else:
++        sources = f"""### News headlines — {news_source}, past 7 days
+ Institutional framing. Fact-driven, slower-moving signal.
+ 
+ <start_of_news>
+@@ -139,11 +206,9 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
+ 
+ <start_of_reddit>
+ {reddit_block}
+-<end_of_reddit>
++<end_of_reddit>"""
+ 
+-## How to analyze this data (best practices)
+-
+-1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
++        analysis = """1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
+ 
+ 2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
+ 
+@@ -157,17 +222,29 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
+ 
+ 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
+ 
+-8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
++8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call."""
++
++        output = """1. **Overall sentiment direction** — Bullish / Bearish / Neutral / Mixed — with a brief confidence note based on data quality and sample size.
++2. **Source-by-source breakdown** — what each of news / StockTwits / Reddit is telling you, with specific evidence (cite message counts, ratios, notable posts).
++3. **Divergences, alignments, and key narratives** across sources.
++4. **Catalysts and risks** surfaced by the data.
++5. **Markdown table** at the end summarizing key sentiment signals, their direction, source, and supporting evidence."""
++
++    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on {coverage}
++
++## Data sources (pre-fetched, in this prompt)
++
++{sources}
++
++## How to analyze this data (best practices)
++
++{analysis}
+ 
+ ## Output
+ 
+ Produce a sentiment report covering, in order:
+ 
+-1. **Overall sentiment direction** — Bullish / Bearish / Neutral / Mixed — with a brief confidence note based on data quality and sample size.
+-2. **Source-by-source breakdown** — what each of news / StockTwits / Reddit is telling you, with specific evidence (cite message counts, ratios, notable posts).
+-3. **Divergences, alignments, and key narratives** across sources.
+-4. **Catalysts and risks** surfaced by the data.
+-5. **Markdown table** at the end summarizing key sentiment signals, their direction, source, and supporting evidence.
++{output}
+ 
+ {get_language_instruction()}"""
+ 
+diff --git a/tradingagents/agents/schemas.py b/tradingagents/agents/schemas.py
+index 55f0e3c..d8dba7e 100644
+--- a/tradingagents/agents/schemas.py
++++ b/tradingagents/agents/schemas.py
+@@ -18,10 +18,36 @@ so that:
+ 
+ from __future__ import annotations
+ 
++import re
+ from enum import Enum
+ from typing import Optional
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, field_validator
++
++_NUM_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
++
++
++def _lenient_float(v):
++    """Coerce LLM-provided numeric fields without failing the whole call.
++
++    Free/edge models often return \"N/A\", \"~380 RUB\" or \"\" for optional
++    floats; a hard float parse then killed the structured invocation and
++    forced a free-text fallback (observed live on every run). Numbers pass
++    through, numeric strings are parsed best-effort, anything else → None.
++    """
++    if v is None or v == "":
++        return None
++    if isinstance(v, bool):
++        return None
++    if isinstance(v, (int, float)):
++        return float(v)
++    m = _NUM_RE.search(str(v).replace("−", "-"))
++    if not m:
++        return None
++    try:
++        return float(m.group(0).replace(",", "."))
++    except ValueError:
++        return None
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -137,6 +163,11 @@ class TraderProposal(BaseModel):
+         description="Optional sizing guidance, e.g. '5% of portfolio'.",
+     )
+ 
++    @field_validator("entry_price", "stop_loss", mode="before")
++    @classmethod
++    def _coerce_levels(cls, v):
++        return _lenient_float(v)
++
+ 
+ def render_trader_proposal(proposal: TraderProposal) -> str:
+     """Render a TraderProposal to markdown.
+@@ -205,6 +236,11 @@ class PortfolioDecision(BaseModel):
+         description="Optional recommended holding period, e.g. '3-6 months'.",
+     )
+ 
++    @field_validator("price_target", mode="before")
++    @classmethod
++    def _coerce_price_target(cls, v):
++        return _lenient_float(v)
++
+ 
+ def render_pm_decision(decision: PortfolioDecision) -> str:
+     """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
+diff --git a/tradingagents/agents/utils/memory.py b/tradingagents/agents/utils/memory.py
+index c947175..83aa2e9 100644
+--- a/tradingagents/agents/utils/memory.py
++++ b/tradingagents/agents/utils/memory.py
+@@ -34,20 +34,33 @@ class TradingMemoryLog:
+         trade_date: str,
+         final_trade_decision: str,
+     ) -> None:
+-        """Append pending entry at end of propagate(). No LLM call."""
++        """Append pending entry at end of propagate(). No LLM call.
++
++        A same-day re-run for the same ticker REPLACES the existing pending
++        entry: memory (and the past-context injected into analysts) must
++        reflect the LATEST decision, not the first one of the day. Live bug:
++        morning SBER=Sell stuck in memory while afternoon re-runs said
++        Overweight, and analysts kept reasoning from the stale Sell.
++        """
+         if not self._log_path:
+             return
+-        # Idempotency guard: fast raw-text scan instead of full parse
++        rating = parse_rating(final_trade_decision)
++        tag = f"[{trade_date} | {ticker} | {rating} | pending]"
++        entry = f"{tag}\n\nDECISION:\n{final_trade_decision}"
+         if self._log_path.exists():
+             raw = self._log_path.read_text(encoding="utf-8")
+-            for line in raw.splitlines():
+-                if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
++            parts = raw.split(self._SEPARATOR)
++            for i, part in enumerate(parts):
++                stripped = part.strip("\n")
++                first = stripped.splitlines()[0] if stripped else ""
++                if (first.startswith(f"[{trade_date} | {ticker} |")
++                        and first.endswith("| pending]")):
++                    parts[i] = "\n" + entry + "\n"
++                    self._log_path.write_text(
++                        self._SEPARATOR.join(parts), encoding="utf-8")
+                     return
+-        rating = parse_rating(final_trade_decision)
+-        tag = f"[{trade_date} | {ticker} | {rating} | pending]"
+-        entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
+         with open(self._log_path, "a", encoding="utf-8") as f:
+-            f.write(entry)
++            f.write(entry + self._SEPARATOR)
+ 
+     # --- Read path (Phase A) ---
+ 
+diff --git a/tradingagents/llm_clients/openai_client.py b/tradingagents/llm_clients/openai_client.py
+index a5aaafc..9afb810 100644
+--- a/tradingagents/llm_clients/openai_client.py
++++ b/tradingagents/llm_clients/openai_client.py
+@@ -123,13 +123,34 @@ _TRANSIENT_CODES = frozenset({408, 429, 500, 502, 503, 504, 524})
+ 
+ def _is_transient_openrouter_error(exc: Exception) -> bool:
+     """Return True if ``exc`` looks like a retryable OpenRouter/downstream-
+-    provider hiccup. OpenRouter wraps downstream errors as::
++    provider hiccup.
+ 
+-        ValueError({'message': 'Provider returned error', 'code': 502})
++    Two shapes must be classified:
+ 
+-    The ``code`` field carries the downstream HTTP status. We retry on the
+-    usual transient set (502/503/504, 429 rate-limit, 500, 408 timeout).
++    1. OpenRouter wraps downstream errors as::
++
++           ValueError({'message': 'Provider returned error', 'code': 502})
++
++       where ``code`` is the downstream HTTP status (502/503/504, 429, 500,
++       408 are transient).
++
++    2. Transport-level failures — ``openai.APIConnectionError`` /
++       ``APITimeoutError`` (connect reset, DNS, read timeout) — used to
++       escape this check entirely (it only inspected ``exc.args`` payloads)
++       and killed runs instantly on a single network blip (live bug: a real
++       MTSS run died at Portfolio Manager with ``OpenAIConnectionError`` and
++       zero retry attempts logged).
+     """
++    # Transport failures: always worth retrying with backoff.
++    if isinstance(exc, (ConnectionError, TimeoutError)):
++        return True
++    try:
++        from openai import APIConnectionError, APITimeoutError
++
++        if isinstance(exc, (APIConnectionError, APITimeoutError)):
++            return True
++    except ImportError:  # pragma: no cover — openai always present at runtime
++        pass
+     if not exc.args:
+         return False
+     payload = exc.args[0]
+@@ -146,7 +167,7 @@ def _is_transient_openrouter_error(exc: Exception) -> bool:
+     return False
+ 
+ 
+-def _retry_on_transient(fn, *, attempts: int = 4, base_delay: float = 1.5):
++def _retry_on_transient(fn, *, attempts: int = 6, base_delay: float = 3.0):
+     """Run ``fn()`` up to ``attempts`` times, retrying on transient
+     OpenRouter / downstream-provider errors with exponential backoff +
+     jitter. Re-raises the last exception if every attempt fails.
+@@ -160,10 +181,11 @@ def _retry_on_transient(fn, *, attempts: int = 4, base_delay: float = 1.5):
+     for i in range(attempts):
+         try:
+             return fn()
+-        except (ValueError, KeyError, TypeError, AttributeError,
+-                AssertionError, NotImplementedError) as exc:
+-            raise
+         except Exception as exc:  # noqa: BLE001 — broad catch on purpose
++            # NOTE: transient OpenRouter errors surface as ValueError with a
++            # dict payload (see _is_transient_openrouter_error) — they MUST
++            # be retried, while genuine programming ValueErrors (no transient
++            # code inside) still re-raise immediately via the same check.
+             if not _is_transient_openrouter_error(exc) or i == attempts - 1:
+                 raise
+             last_exc = exc
+@@ -478,6 +500,12 @@ class OpenAIClient(BaseLLMClient):
+             if key in self.kwargs:
+                 llm_kwargs[key] = self.kwargs[key]
+ 
++        # Network defaults: a stalled third-party endpoint (observed with
++        # OpenRouter free models) must not freeze the whole run forever.
++        # User-provided kwargs above always win.
++        llm_kwargs.setdefault("timeout", float(os.environ.get("TA_LLM_TIMEOUT", "300")))
++        llm_kwargs.setdefault("max_retries", int(os.environ.get("TA_LLM_MAX_RETRIES", "3")))
++
+         # Native OpenAI: use Responses API for consistent behavior across
+         # all model families. Third-party providers use Chat Completions.
+         if self.provider == "openai":

@@ -17,6 +17,9 @@ TA_ROOT = ROOT / "upstream" / "tradingagents"
 def isolated_home(tmp_path, monkeypatch):
     """Keep every test away from the real ~/.tradingagents directory."""
     monkeypatch.setenv("TRADINGAGENTS_HOME", str(tmp_path / "ta-home"))
+    # Never let the scheduled auto-trading worker survive into a test run:
+    # importing gui.app registers routes on the real application object.
+    monkeypatch.setenv("TRADINGAGENTS_AUTOTRADE", "0")
     monkeypatch.delenv("TINVEST_TOKEN", raising=False)
     monkeypatch.delenv("TRADINGAGENTS_TINVEST_TOKEN", raising=False)
     return tmp_path / "ta-home"

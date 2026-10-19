@@ -56,8 +56,35 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "sandbox_auto_confirm": False,         # never applies to production
         "use_learned_insights": True,
     },
-    # T-Invest connection mode: disabled | readonly | sandbox |
-    # live_readonly | live_trading (live_trading is refused in this build).
+    # Auto-trading engine (spec §6.2 + the §13 automation exception).
+    #
+    # OFF everywhere by default, and it never turns itself on: a live cycle
+    # additionally needs tinvest.mode == "live_trading", live_confirmed and
+    # risk.automation_sandbox_only == False, each set deliberately
+    # (spec §1.1 item 14, §6.5, §16).
+    "autotrade": {
+        "enabled": False,                      # master switch
+        "environment": "sandbox",              # sandbox | live
+        "live_confirmed": False,               # explicit ack for live money
+        "kill_switch": False,                  # stop now; keeps `enabled`
+        "tick_seconds": 300,                   # loop cadence
+        "watchlist": ["SBER"],                 # tickers analysed each cycle
+        "max_orders_per_day": 3,               # hard cap per calendar day
+        "max_open_positions": 3,               # stop adding beyond this
+        "skip_if_holding": True,               # don't re-buy what we hold
+        "analysts": ["market", "social", "news", "fundamentals"],
+        "research_depth": 3,
+        "language": "English",
+        "run_timeout_seconds": 2700,           # one analysis budget: a full
+                                               # 4-analyst cycle measures
+                                               # 1050-1250 s, and a call that
+                                               # stalls on a 504 costs up to
+                                               # 3 * TA_LLM_TIMEOUT more
+        "only_when_market_open": True,
+    },
+    # T-Invest connection mode (spec §5.1): disabled | readonly | sandbox |
+    # live_readonly | live_trading. Each is a first-class mode; the read-only
+    # pair refuses every mutating call, `disabled` refuses to connect.
     "tinvest": {
         "mode": "sandbox",
         "active_account": None,                # sandbox account id chosen in the GUI
@@ -65,6 +92,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "base_url": None,                      # None = mode-appropriate default
         "mcp_url": None,                       # None = mode-appropriate default
         "verify_ca_fallback": True,
+    },
+    # Scoring of a decision after its holding window has traded (memory log
+    # reflection). Upstream falls back to SPY for a suffix-less ticker and
+    # reads closes from yfinance, which serves no Russian bars — so without
+    # this the alpha line is wrong *and* every MOEX entry stays pending.
+    # Read by integration.moex_settlement; both the label and the series use it.
+    "evaluation": {
+        "benchmark": "IMOEX",                   # secid индекса на MOEX ISS
     },
 }
 

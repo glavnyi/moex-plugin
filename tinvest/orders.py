@@ -1,9 +1,12 @@
-"""Trade orders in the sandbox — spec §5.5, §5.6.
+"""Trade orders — spec §5.5, §5.6.
 
 Idempotency: every placement gets a client-generated ``client_order_id``
 (reused on retry), is journaled to disk *before* the network call, and
-re-sends after a timeout reuse the same id — the broker dedupes. Production
-accounts are rejected outright.
+re-sends after a timeout reuse the same id — the broker dedupes.
+
+Venue follows the §5.1 connection mode: ``sandbox`` uses SandboxService,
+``live_trading`` uses OrdersService against production. Both refuse to run
+on a client whose ``can_mutate`` is false.
 """
 
 from __future__ import annotations
@@ -50,7 +53,23 @@ def journal_entries() -> list[dict]:
 
 
 def new_client_order_id() -> str:
-    return f"moex-{uuid.uuid4().hex}"
+    # T-Invest PostSandboxOrder rejects anything but a strict RFC-4122 UUID
+    # ("`order id` has invalid UUID format", code 30028 — live-verified);
+    # prefixed ids like "moex-<hex>" or "ta-<preview>" never reach matching.
+    return str(uuid.uuid4())
+
+
+def _services(client: TInvestClient) -> tuple[str, str, str]:
+    """(service, post_method, cancel_method) for the client's venue.
+
+    Sandbox and production expose the same contract under different names —
+    live-verified against the official openapi: OrdersService/PostOrder and
+    OrdersService/CancelOrder on production, SandboxService/PostSandboxOrder
+    and SandboxService/CancelSandboxOrder in the sandbox.
+    """
+    if client.sandbox:
+        return "SandboxService", "PostSandboxOrder", "CancelSandboxOrder"
+    return "OrdersService", "PostOrder", "CancelOrder"
 
 
 def post_order(
@@ -69,8 +88,7 @@ def post_order(
     Never auto-retried with a fresh id (spec §5.6): pass the previous
     ``client_order_id`` on retry so the broker sees the same request.
     """
-    if not client.sandbox:
-        raise TInvestError("post_order is sandbox-only in this version")
+    client.require_mutation("post_order")
     direction_key = direction.lower()
     type_key = (order_type or "market").lower()
     if direction_key not in _DIRECTIONS:
@@ -97,7 +115,8 @@ def post_order(
     _journal({
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": "post_order.attempt",
-        "sandbox": True,
+        "sandbox": client.sandbox,
+        "mode": client.mode,
         "account_id": account_id,
         "figi": figi,
         "direction": direction_key,
@@ -107,9 +126,59 @@ def post_order(
         "client_order_id": cid,
     })
 
+    service, post_method, _ = _services(client)
     try:
-        data = client.call("SandboxService", "PostSandboxOrder", payload)
+        data = client.call(service, post_method, payload)
     except TInvestError as exc:
+        # Spec §5.6 idempotency: re-sending the same client_order_id after a
+        # timeout must NOT create a second order. The broker recognises the
+        # duplicate but the sandbox execution report may not be retrievable,
+        # answering 30057 "The order is a duplicate, but the order report was
+        # not found" (live-verified). Treat it as a successful placement:
+        # recover via GET state, honour the original order_id, and mark it
+        # deduped so callers never mint a fresh id.
+        if "30057" in str(exc) or "duplicate" in str(exc).lower():
+            order = None
+            try:
+                order = get_order_state(client, account_id, cid)
+            except TInvestError:
+                order = None
+            recovered_id = getattr(order, "order_id", None) or ""
+            if not recovered_id or recovered_id == cid:
+                # Sandbox GET-state by client id can 404 on a dedup; the real
+                # order is still resting. Recover its id from the live open
+                # book so callers can track/cancel the genuine order (live-
+                # verified: duplicate returned a DIFFERENT order_id while the
+                # original stayed open).
+                try:
+                    for o in list_orders(client, account_id):
+                        if o.client_order_id == cid or o.client_order_id == "":
+                            recovered_id = o.order_id
+                            order = o
+                            break
+                except TInvestError:
+                    pass
+            _journal({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": "post_order.result",
+                "client_order_id": cid,
+                "order_id": recovered_id or cid,
+                "status": getattr(order, "status", "") or "DEDUPED",
+                "deduped": True,
+            })
+            return {
+                "order_id": recovered_id or cid,
+                "client_order_id": cid,
+                "status": getattr(order, "status", "") or "DEDUPED",
+                "lots_requested": getattr(order, "lots_requested", None) or int(quantity_lots),
+                "lots_executed": getattr(order, "lots_executed", 0) or 0,
+                "message": "duplicate client_order_id re-sent (idempotent); "
+                           "no second order created",
+                "deduped": True,
+                "sandbox": client.sandbox,
+                "mode": client.mode,
+                "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            }
         _journal({
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": "post_order.error",
@@ -135,7 +204,8 @@ def post_order(
         "lots_requested": order.lots_requested,
         "lots_executed": order.lots_executed,
         "message": order.message,
-        "sandbox": True,
+        "sandbox": client.sandbox,
+        "mode": client.mode,
         "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
 
@@ -162,15 +232,15 @@ def list_orders(client: TInvestClient, account_id: str) -> list[Order]:
 
 
 def cancel_order(client: TInvestClient, account_id: str, order_id: str) -> dict:
-    if not client.sandbox:
-        raise TInvestError("cancel_order is sandbox-only in this version")
+    client.require_mutation("cancel_order")
     _journal({
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": "cancel_order.attempt",
         "account_id": account_id,
         "order_id": order_id,
     })
-    client.call("SandboxService", "CancelSandboxOrder",
+    service, _, cancel_method = _services(client)
+    client.call(service, cancel_method,
                 {"accountId": account_id, "orderId": order_id})
     state = get_order_state(client, account_id, order_id)
     _journal({

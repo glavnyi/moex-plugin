@@ -97,7 +97,9 @@ def test_non_sandbox_context_rejected():
            "positions": []}
     result = check_proposal(_proposal(), ctx, None)
     assert not result.allowed
-    assert any("песочница" in v for v in result.violations)
+    # No mode configured → fail closed, and the message names the way out.
+    assert any("live_trading" in v for v in result.violations)
+    assert any("§5.1" in v for v in result.violations)
 
 
 def test_size_position_caps_by_cash_and_pct():
@@ -108,3 +110,92 @@ def test_size_position_caps_by_cash_and_pct():
     amount = sizing["lots"] * 300.0
     assert amount <= 100_000.0
     assert amount / 1_000_000.0 * 100 <= 30.0 + 1e-9
+
+
+def test_daily_loss_limit_violated_by_realized_losses(tmp_path, monkeypatch,
+                                                      sandbox_ctx):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("TRADINGAGENTS_HOME", str(tmp_path))
+    lessons = tmp_path / "tinvest" / "lessons.jsonl"
+    lessons.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone(timedelta(hours=3))).isoformat()
+    row = {"id": "x1", "created_at": today, "realized_pnl": -120.0,
+           "enabled": True, "used_in_future_runs": False,
+           "proposal": {"ticker": "SBER", "side": "sell"},
+           "execution": {}, "explanation": "loss"}
+    lessons.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    settings = {"risk": {"daily_loss_limit": 100.0}}
+    result = check_proposal(_proposal(), sandbox_ctx, settings)
+    assert not result.allowed
+    assert any("дневной лимит потерь" in v for v in result.violations)
+
+
+def test_daily_loss_limit_ok_when_within_budget(tmp_path, monkeypatch,
+                                                sandbox_ctx):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("TRADINGAGENTS_HOME", str(tmp_path))
+    lessons = tmp_path / "tinvest" / "lessons.jsonl"
+    lessons.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone(timedelta(hours=3))).isoformat()
+    row = {"id": "x1", "created_at": today, "realized_pnl": -40.0,
+           "enabled": True, "used_in_future_runs": False,
+           "proposal": {"ticker": "SBER", "side": "sell"},
+           "execution": {}, "explanation": "small loss"}
+    lessons.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    settings = {"risk": {"daily_loss_limit": 100.0}}
+    result = check_proposal(_proposal(), sandbox_ctx, settings)
+    assert result.allowed, result.violations
+    assert any("realized PnL" in w for w in result.warnings)
+
+
+def test_daily_loss_limit_not_enforced_when_unset(tmp_path, monkeypatch,
+                                                  sandbox_ctx):
+    monkeypatch.setenv("TRADINGAGENTS_HOME", str(tmp_path))
+    result = check_proposal(_proposal(), sandbox_ctx, None)
+    assert result.allowed, result.violations
+    assert not any("дневной лимит" in v for v in result.violations)
+
+
+# --------------------------------------------------------------------------
+# venue (§5.1) — a production context is only tradeable in live_trading
+# --------------------------------------------------------------------------
+
+def _production_ctx(sandbox_ctx):
+    ctx = dict(sandbox_ctx)
+    ctx["sandbox"] = False
+    return ctx
+
+
+def test_production_context_is_refused_without_live_trading(sandbox_ctx):
+    for settings in (None, {"tinvest": {"mode": "sandbox"}},
+                     {"tinvest": {"mode": "readonly"}},
+                     {"tinvest": {"mode": "disabled"}}):
+        result = check_proposal(_proposal(), _production_ctx(sandbox_ctx), settings)
+        assert not result.allowed
+        assert any("live_trading" in v for v in result.violations), result.violations
+
+
+def test_production_context_is_allowed_in_live_trading(sandbox_ctx):
+    settings = {"tinvest": {"mode": "live_trading"}}
+    result = check_proposal(_proposal(), _production_ctx(sandbox_ctx), settings)
+    assert result.allowed, result.violations
+
+
+def test_automation_scope_does_not_gate_the_manual_venue(sandbox_ctx):
+    # §13's switch is about automation, not about which broker is reachable;
+    # it stays enforced by the auto-trading gates instead.
+    settings = {"tinvest": {"mode": "live_trading"},
+                "risk": {"automation_sandbox_only": True}}
+    result = check_proposal(_proposal(), _production_ctx(sandbox_ctx), settings)
+    assert result.allowed, result.violations
+
+
+def test_sandbox_context_needs_no_mode(sandbox_ctx):
+    # Sandbox keeps working with no settings at all — the default install.
+    assert check_proposal(_proposal(), sandbox_ctx, None).allowed

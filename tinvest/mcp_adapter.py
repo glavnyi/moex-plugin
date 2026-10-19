@@ -41,6 +41,30 @@ class McpError(RuntimeError):
     pass
 
 
+def _sse_message(raw: bytes) -> dict | None:
+    """First complete JSON-RPC message among the SSE frames received so far.
+
+    SSE frames end with a blank line, and only *complete* frames are parsed,
+    so a chunk boundary (or the spec §13 size bound) landing mid-JSON can
+    never yield a truncated message. Multiple ``data:`` lines in one frame
+    are joined with a newline per the SSE spec.
+    """
+    text = raw.replace(b"\r\n", b"\n").decode("utf-8", "ignore")
+    frames = text.split("\n\n")
+    for frame in frames[:-1]:  # the last element may still be incomplete
+        data_lines = [ln[5:].lstrip() for ln in frame.splitlines()
+                      if ln.startswith("data:")]
+        if not data_lines:
+            continue
+        try:
+            message = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict) and "id" in message:
+            return message
+    return None
+
+
 class McpClient:
     def __init__(self, url: str, token: str, *, sandbox: bool = True,
                  timeout: float = 20.0):
@@ -49,6 +73,12 @@ class McpClient:
         self.url = url
         self.sandbox = sandbox
         self._session = requests.Session()
+        # T-Bank endpoints use the Russian trusted CA chain which is absent
+        # from the system store — verify with our combined bundle.
+        from .client import cert_bundle
+        bundle = cert_bundle()
+        if bundle:
+            self._session.verify = bundle
         self._session.headers.update({
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -82,25 +112,26 @@ class McpClient:
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "event-stream" in ctype:
             raw = b""
+            message = None
             for chunk in resp.iter_content(8192):
                 raw += chunk
+                message = _sse_message(raw)
+                if message is not None:
+                    break
                 if len(raw) > MAX_CONTENT:
-                    break
-                if b"\n\n" in raw and b'"result"' in raw:
-                    break
-            body = raw.decode("utf-8", "ignore")
-            data = None
-            for line in body.splitlines():
-                if line.startswith("data:"):
-                    try:
-                        candidate = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(candidate, dict) and "id" in candidate:
-                        data = candidate
-            if data is None:
+                    # Spec §13 bound: a message bigger than the cap cannot be
+                    # delivered whole — say so distinctly (callers retry with
+                    # fewer items) instead of parsing a stump of JSON.
+                    raise McpError(
+                        f"MCP SSE response exceeds the {MAX_CONTENT}-byte bound"
+                    )
+            if message is None:
+                # The server closed the stream: dispatch the trailing frame.
+                message = _sse_message(raw + b"\n\n")
+            if message is None:
+                body = raw.decode("utf-8", "ignore")
                 raise McpError(f"no JSON-RPC message in SSE stream: {body[:200]!r}")
-            return data
+            return message
         try:
             return resp.json()
         except ValueError as exc:
@@ -179,10 +210,21 @@ def _to_items(text: str, source: SourceDef, limit: int) -> list[NewsItem]:
         if not title:
             continue
         url = str(row.get("url") or row.get("link") or row.get("sourceUrl") or "")
+        # T-Invest news rows carry their time in ``ts`` (RFC3339, possibly
+        # nanosecond precision); RSS-shaped rows use publishedAt/date/time.
+        # An unparsed date would bypass the since/until filters and leak
+        # today's wire into historical cells — so ``ts`` must be honoured.
         published_raw = (row.get("publishedAt") or row.get("date")
-                         or row.get("time") or "")
+                         or row.get("time") or row.get("ts") or "")
         published = None
-        if isinstance(published_raw, str) and published_raw:
+        if isinstance(published_raw, (int, float)) and published_raw:
+            try:
+                published = datetime.fromtimestamp(
+                    float(published_raw) / (1000.0 if published_raw > 1e12 else 1.0),
+                    tz=timezone.utc).replace(tzinfo=None)
+            except (OverflowError, OSError, ValueError):
+                published = None
+        elif isinstance(published_raw, str) and published_raw:
             try:
                 published = datetime.fromisoformat(
                     published_raw.replace("Z", "+00:00")
@@ -194,7 +236,8 @@ def _to_items(text: str, source: SourceDef, limit: int) -> list[NewsItem]:
             source_id=source.id,
             source_name=source.name,
             title=title,
-            summary=str(row.get("summary") or row.get("text") or "")[:700],
+            summary=str(row.get("summary") or row.get("text")
+                        or row.get("content") or "")[:700],
             url=url,
             published_at=published,
             fetched_at=now,
@@ -204,7 +247,8 @@ def _to_items(text: str, source: SourceDef, limit: int) -> list[NewsItem]:
 
 
 def fetch_market_news(*, since: datetime | None, until: datetime | None,
-                      limit: int = 30, source: SourceDef | None = None) -> list[NewsItem]:
+                      limit: int = 30, source: SourceDef | None = None,
+                      instrument=None) -> list[NewsItem]:
     """News via official T-Invest MCP. Requires TINVEST_TOKEN."""
     source = source or SourceDef(
         id="tinvest-news", name="T-Invest MCP", kind="tinvest-mcp",
@@ -235,20 +279,60 @@ def fetch_market_news(*, since: datetime | None, until: datetime | None,
         name = str(tool.get("name"))
         schema = (tool.get("inputSchema") or {}).get("properties") or {}
         required = (tool.get("inputSchema") or {}).get("required") or []
-        variants: list[dict] = [{}]
         base: dict = {}
-        if any(k in schema for k in ("limit", "count", "pageSize")):
-            key = next(k for k in ("limit", "count", "pageSize") if k in schema)
-            base[key] = int(limit)
-        if any("instrument" in k or k in ("figi", "ticker", "uid") for k in schema):
-            pass  # market-wide news call preferred; instrument tools skipped
+        limit_key = next((k for k in ("limit", "count", "pageSize")
+                          if k in schema), None)
+        if limit_key is not None:
+            base[limit_key] = int(limit)
+        # Issuer-scoped call when we know the instrument: the real tool
+        # (invest_get_news) accepts ``instrumentId`` = ticker and then
+        # returns that issuer's news instead of the market-wide wire,
+        # which used to flood the corpus and starve ticker linking.
+        inst_keys: list[str] = []
+        if instrument is not None:
+            secid = str(getattr(instrument, "secid", "") or "").strip()
+            isin = str(getattr(instrument, "isin", "") or "").strip()
+            for k in schema:
+                kl = k.lower()
+                if kl in ("instrumentid", "instrument", "ticker", "tickers",
+                          "secid", "figi"):
+                    base[k] = secid
+                    inst_keys.append(k)
+                elif kl == "isin" and isin:
+                    base[k] = isin
+                    inst_keys.append(k)
         if required and any(k not in base for k in required):
             # unknown required params → try as-is anyway, honest failure below
             attempts.append(f"{name}: required params {required} unknown, trying empty")
-        variants.append(dict(base))
+        # Preferred order: issuer-scoped first, market-wide as fallback.
+        variants: list[dict] = []
+        if inst_keys:
+            variants.append(dict(base))
+            variants.append({k: v for k, v in base.items() if k not in inst_keys})
+        else:
+            variants.append(dict(base))
         for args in variants:
-            try:
-                result = client.call_tool(name, args)
+            attempt_limit = int(limit)
+            while True:
+                call_args = dict(args)
+                if limit_key is not None:
+                    call_args[limit_key] = attempt_limit
+                try:
+                    result = client.call_tool(name, call_args)
+                except McpError as exc:
+                    # A full-text news payload can exceed the transport bound
+                    # (live: 80 items > the 400 KB SSE cap). Ask for fewer
+                    # items instead of losing the whole source — the §13
+                    # download bound stays intact.
+                    if ("exceeds" in str(exc) and limit_key is not None
+                            and attempt_limit > 10):
+                        attempts.append(
+                            f"{name}: payload too large at limit={attempt_limit}, "
+                            f"retrying with {max(10, attempt_limit // 2)}")
+                        attempt_limit = max(10, attempt_limit // 2)
+                        continue
+                    attempts.append(f"{name}({list(args)}): {exc}")
+                    break
                 items = _to_items(_tool_text(result), source, limit)
                 if since:
                     items = [i for i in items
@@ -257,9 +341,6 @@ def fetch_market_news(*, since: datetime | None, until: datetime | None,
                     items = [i for i in items
                              if i.published_at is None or i.published_at <= until]
                 return items[:limit]
-            except McpError as exc:
-                attempts.append(f"{name}({list(args)}): {exc}")
-                continue
     raise AdapterError(
         "tinvest-news: all news tool calls failed — " + " | ".join(attempts[:4])
     )

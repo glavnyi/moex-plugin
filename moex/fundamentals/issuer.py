@@ -150,40 +150,75 @@ def fundamentals_report(ticker: str, curr_date: str, *, market=None, board=None)
     if instrument.issue_size:
         lines.append(f"Issue size: {instrument.issue_size}")
 
+    # Point-in-time honesty: a historical cell must never see today's price.
+    # A live run keeps the intraday quote; a past date gets its "last" from
+    # the same as-of candles the range statistics use below, so the snapshot
+    # header's date and the price basis always agree.
+    today = datetime.now().strftime("%Y-%m-%d")
+    live = str(curr_date)[:10] >= today
     quote = None
-    try:
-        quote = get_quote(instrument, market=market, board=board)
-    except Exception:  # noqa: BLE001
-        pass
+    if live:
+        try:
+            quote = get_quote(instrument, market=market, board=board)
+        except Exception:  # noqa: BLE001
+            quote = None
 
-    last = (quote or {}).get("last") or instrument.prev_close
+    hist = None
+    hist_error = None
+    try:
+        hist = load_ohlcv(instrument.secid, curr_date, market=market, board=board)
+        if hist is not None and hist.empty:
+            hist = None
+    except Exception as exc:  # noqa: BLE001
+        hist_error = exc
+
+    last = (quote or {}).get("last")
+    if last is None and hist is not None:
+        last = float(hist["Close"].iloc[-1])  # close on or before curr_date
+    if last is None and live:
+        last = instrument.prev_close
     if instrument.issue_size and last:
+        basis = "last price" if quote else "last close on or before curr_date"
         lines.append(
             f"Market cap (computed): {float(instrument.issue_size) * float(last):,.0f} "
-            f"{instrument.currency or ''} (issue size x last price)"
+            f"{instrument.currency or ''} (issue size x {basis})"
         )
     if quote:
         lines.append(f"Last price: {quote.get('last')}")
         lines.append(f"Previous close: {quote.get('prev_close')}")
         lines.append(f"Quote time: {quote.get('quote_time')} (source: {quote.get('source')})")
+    elif hist is not None:
+        asof = hist["Date"].iloc[-1]
+        asof_str = (asof.strftime("%Y-%m-%d")
+                    if hasattr(asof, "strftime") else str(asof)[:10])
+        lines.append(f"Last close (as of {asof_str}): {float(hist['Close'].iloc[-1])}")
+        if len(hist) > 1:
+            lines.append(f"Previous close: {float(hist['Close'].iloc[-2])}")
+        lines.append(
+            "Quote time: n/a — historical date; prices above are point-in-time "
+            "MOEX ISS closes, never today's quote"
+        )
+    else:
+        lines.append(
+            "Last price: unavailable (no MOEX candles on or before this date"
+            + (f": {hist_error})" if hist_error is not None else ")")
+        )
 
     # Derived range stats (computed from MOEX candles, never from the future).
-    try:
-        hist = load_ohlcv(instrument.secid, curr_date, market=market, board=board)
-        if not hist.empty:
-            window = hist.tail(252)
-            lines.append(
-                f"52-week high (computed): {float(window['High'].max()):.2f}"
-            )
-            lines.append(
-                f"52-week low (computed): {float(window['Low'].min()):.2f}"
-            )
-            lines.append(
-                f"Average daily volume, 30d (computed): "
-                f"{float(window['Volume'].tail(30).mean()):,.0f}"
-            )
-    except Exception as exc:  # noqa: BLE001
-        lines.append(f"Price statistics: unavailable ({exc})")
+    if hist is not None:
+        window = hist.tail(252)
+        lines.append(
+            f"52-week high (computed): {float(window['High'].max()):.2f}"
+        )
+        lines.append(
+            f"52-week low (computed): {float(window['Low'].min()):.2f}"
+        )
+        lines.append(
+            f"Average daily volume, 30d (computed): "
+            f"{float(window['Volume'].tail(30).mean()):,.0f}"
+        )
+    elif hist_error is not None:
+        lines.append(f"Price statistics: unavailable ({hist_error})")
 
     if instrument.instrument_type == "bond":
         coupons = get_coupons(instrument.secid, limit=5)

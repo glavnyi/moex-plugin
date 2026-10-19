@@ -35,7 +35,9 @@ def list_operations(
     for op in data.get("operations") or []:
         payment = quotation_to_float(op.get("payment"))
         out.append({
-            "operation_id": op.get("operationId") or "",
+            # Sandbox actually returns the id under "id" (live-verified);
+            # "operationId" kept as a fallback for schema drift.
+            "operation_id": op.get("id") or op.get("operationId") or "",
             "date": str(op.get("date") or "")[:19],
             "type": op.get("type") or "",
             "status": op.get("state") or "",

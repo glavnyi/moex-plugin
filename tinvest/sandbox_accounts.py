@@ -7,10 +7,15 @@ from .models import Account, Money, quotation_to_float
 
 
 def require_sandbox(client: TInvestClient) -> TInvestClient:
+    """Account open/close/pay-in are virtual-money operations (spec §5.2, §5.4).
+
+    The production API exposes no equivalent, so these stay sandbox-only
+    regardless of mode — a live account is opened at the broker, not here.
+    """
     if not client.sandbox:
         raise TInvestError(
-            "account mutations are sandbox-only in this version; "
-            "production is read-only (spec §6.5)"
+            "account open/close/pay-in is a sandbox (virtual money) operation; "
+            f"tinvest.mode={client.mode!r} targets {client.environment}"
         )
     return client
 
@@ -40,7 +45,9 @@ def pay_in(client: TInvestClient, account_id: str, amount: float,
     if amount <= 0:
         raise TInvestError("amount must be positive")
     payload = client.sandbox_pay_in(account_id, amount, currency)
-    money = payload.get("money") or payload
+    # SandboxPayInResponse: { balance: MoneyValue } (openapi v1.4); keep
+    # legacy "money" as a fallback for older gateways.
+    money = payload.get("balance") or payload.get("money") or payload
     return {
         "account_id": account_id,
         "amount": quotation_to_float(money) if isinstance(money, dict) else amount,

@@ -75,3 +75,20 @@ def test_lessons_block_is_informational_capped_and_skips_used():
     used = load_lessons()[0]
     assert _rewrite_lesson(used["id"], {"used_in_future_runs": True}) is True
     assert used["id"] not in lessons_block(max_items=100)
+
+
+def test_store_decision_replaces_same_day_pending(tmp_path):
+    """Same-day re-run must UPDATE memory, not keep the stale first call."""
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+
+    log = TradingMemoryLog({"memory_log_path": str(tmp_path / "m.md")})
+    log.store_decision("SBER", "2026-10-14", "**Rating**: Sell\n\n thesis")
+    log.store_decision("SBER", "2026-10-14", "**Rating**: Overweight\n\n thesis")
+    entries = log.load_entries()
+    assert len(entries) == 1
+    raw = (tmp_path / "m.md").read_text(encoding="utf-8")
+    assert "Overweight" in raw
+    assert "Sell" not in raw
+
+    log.store_decision("SBER", "2026-10-15", "**Rating**: Hold\n\n thesis")
+    assert len(log.load_entries()) == 2

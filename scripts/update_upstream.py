@@ -25,12 +25,38 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def update_project(name: str, root: Path, ref: str, force: bool) -> str:
+def _ref_exists(root: Path, ref: str) -> bool:
+    """True when ref resolves to a commit in this checkout (after fetch)."""
+    for spec in (ref, f"refs/tags/{ref}", f"refs/remotes/origin/{ref}"):
+        probe = _git(root, "rev-parse", "--verify", "--quiet",
+                     f"{spec}^{{commit}}")
+        if probe.returncode == 0 and probe.stdout.strip():
+            return True
+    return False
+
+
+def _patch_override(name: str, root: Path) -> dict:
+    """Map a pinned-project name to the manifest «projects» key."""
+    return {"tradingagents-gui" if name == "TradingAgents-GUI" else name:
+            str(root)}
+
+
+def update_project(name: str, root: Path, ref: str, pin: str,
+                   force: bool) -> str:
     if not (root / ".git").exists():
         return f"missing checkout: {root}"
     fetch = _git(root, "fetch", "origin", "--tags")
     if fetch.returncode != 0:
         return f"fetch failed: {fetch.stderr.strip()[:200]}"
+    # One --ref may not exist in every repo (the two upstreams have their own
+    # tags). Never destroy a working copy over it: keep the pinned commit.
+    target = ref
+    note = ""
+    if not _ref_exists(root, ref):
+        if ref == pin:
+            return f"pinned commit {pin[:12]} not found — run git fetch"
+        target = pin
+        note = f"[skip] ref {ref} not in {name}; kept pinned {pin[:12]} — "
     # Drop local modifications so the checkout is pristine before re-applying.
     reset = _git(root, "reset", "--hard")
     if reset.returncode != 0:
@@ -38,16 +64,19 @@ def update_project(name: str, root: Path, ref: str, force: bool) -> str:
     clean = _git(root, "clean", "-fd")
     if clean.returncode != 0:
         return f"clean failed: {clean.stderr.strip()[:200]}"
-    checkout = _git(root, "checkout", "--detach", ref)
+    checkout = _git(root, "checkout", "--detach", target)
     if checkout.returncode != 0:
-        return f"checkout {ref} failed: {checkout.stderr.strip()[:200]}"
+        # Restore the pinned state so the copy is never left bare.
+        _git(root, "reset", "--hard", pin)
+        apply_all(None, REPO_ROOT, _patch_override(name, root),
+                  force=force, quiet=True)
+        return (f"checkout {target} failed: {checkout.stderr.strip()[:200]}"
+                f" (restored pinned {pin[:12]})")
     head = _git(root, "rev-parse", "HEAD").stdout.strip()
     print(f"  {name}: now at {head[:12]}")
-    results = apply_all(None, REPO_ROOT,
-                        {"tradingagents": str(root)} if name == "tradingagents"
-                        else {"TradingAgents-GUI": str(root)},
+    results = apply_all(None, REPO_ROOT, _patch_override(name, root),
                         force=force, quiet=True)
-    return ", ".join(f"{Path(k).name}={v}" for k, v in results.items())
+    return note + ", ".join(f"{Path(k).name}={v}" for k, v in results.items())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, pin in manifest["pinned"].items():
         ref = args.ref or pin["commit"]
         print(f"-> {name} @ {ref}")
-        msg = update_project(name, roots[name], ref, args.force)
+        msg = update_project(name, roots[name], ref, pin["commit"], args.force)
         print("  ", msg)
         if "failed" in msg or "missing" in msg:
             failed = True

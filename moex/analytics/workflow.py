@@ -1,6 +1,12 @@
-"""Analysis → proposal → risk → confirmation → sandbox order → lessons
-(spec §6.2, §11). Nothing here auto-executes: every placement requires
-``confirm=True`` which the GUI only sends after an explicit user click.
+"""Analysis → proposal → risk → confirmation → order → lessons
+(spec §6.2, §11).
+
+Two callers reach ``place_confirmed_order``: the GUI, whose ``confirm=True``
+follows an explicit user click; and the auto-trading cycle
+(``integration/autotrade_service.py``), which supplies the "отдельное
+разрешение" §6.2 asks for by passing its own gate chain first. In both cases
+the risk check re-runs against fresh portfolio state immediately before the
+send — there is no path to an order that skips it.
 """
 
 from __future__ import annotations
@@ -87,7 +93,11 @@ def build_analysis_context(
     except Exception as exc:  # noqa: BLE001
         ctx["fundamentals_error"] = str(exc)
     if include_news:
-        agg = fetch_all(instrument=instrument, days=news_days, limit=60)
+        # Point-in-time: лента обрезается по дате ячейки (как
+        # snapshot_news_window в gui_adapter) — иначе историческая ячейка
+        # увидела бы свежие новости: без until фид отдаёт последние дни.
+        agg = fetch_all(instrument=instrument, days=news_days, limit=60,
+                        until=_news_until(curr_date))
         ctx["news_report"] = news_report(
             agg.items, instrument.secid,
             _shift_days(curr_date, news_days), curr_date, linked=True,
@@ -98,11 +108,44 @@ def build_analysis_context(
     return ctx
 
 
+def _news_until(curr_date: str):
+    """Обрезка ленты: конец дня ячейки, но не позже «сейчас»."""
+    from datetime import timedelta
+
+    end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return min(now, end_dt + timedelta(days=1) - timedelta(seconds=1))
+
+
 def _shift_days(date_str: str, days: int) -> str:
     from datetime import timedelta
 
     base = datetime.strptime(date_str, "%Y-%m-%d")
     return (base - timedelta(days=int(days))).strftime("%Y-%m-%d")
+
+
+def _price_hint(portfolio_ctx: dict | None, ticker, limit_price):
+    """Best known price for a proposal: its own limit, then the caller's
+    quote, then the current price of the position already held.
+
+    ``portfolio_context()`` carries no top-level ``last_price`` (only the GUI
+    preview adds it), so without this chain an auto-trade market order had no
+    price at all and its amount stayed unknown.
+    """
+    if limit_price:
+        return limit_price
+    ctx = portfolio_ctx or {}
+    if ctx.get("last_price"):
+        return ctx["last_price"]
+    want = str(ticker or "").upper()
+    for p in ctx.get("positions") or []:
+        if str(p.get("ticker") or "").upper() != want:
+            continue
+        if str(p.get("type") or "").lower() == "currency":
+            continue
+        if p.get("current_price"):
+            return p["current_price"]
+    return None
 
 
 def prepare_order(
@@ -115,16 +158,32 @@ def prepare_order(
 ) -> dict:
     """Pre-trade preview (§5.5): side, lots, est. amount + risk verdict."""
     prop = proposal.to_dict() if isinstance(proposal, TradeProposal) else dict(proposal)
-    price = prop.get("limit_price") or (portfolio_ctx.get("last_price")
-                                        if portfolio_ctx else None)
+    price = _price_hint(portfolio_ctx, prop.get("ticker"), prop.get("limit_price"))
     if prop["side"] == "buy" and not prop.get("lots"):
         if price:
             sizing = size_position("buy", float(price), portfolio_ctx, settings,
                                    lot_size=lot_size)
             prop["lots"] = sizing["lots"]
-            prop["estimated_amount"] = round(sizing["lots"] * float(price), 2)
-    if prop["side"] == "buy" and prop.get("lots") and price and not prop.get("estimated_amount"):
-        prop["estimated_amount"] = round(prop["lots"] * float(price), 2)
+    if prop["side"] == "sell" and not prop.get("lots"):
+        # Default a bare SELL to the full held position (shorts are
+        # forbidden by the risk engine anyway) — otherwise lots stay None
+        # and the broker call crashes on int(None) (live UI bug).
+        held_qty = None
+        for p in (portfolio_ctx or {}).get("positions") or []:
+            same = str(p.get("ticker") or "").upper() == str(prop.get("ticker") or "").upper()
+            not_cash = str(p.get("type") or "").lower() != "currency"
+            if same and not_cash and p.get("quantity_lots") is not None:
+                held_qty = float(p["quantity_lots"])
+                break
+        if held_qty:
+            prop["lots"] = max(1, int(held_qty))
+    if prop["side"] in ("buy", "sell") and prop.get("lots") and price:
+        # Always recompute: the proposal's own estimate knows nothing about
+        # lot size, so for a lot≠1 instrument (MOEX bonds trade in 100s) the
+        # stale figure understated exposure by that whole factor and let an
+        # order past every money limit in §6.3.
+        prop["estimated_amount"] = round(
+            int(prop["lots"]) * float(price) * int(lot_size or 1), 2)
     risk = check_proposal(prop, portfolio_ctx, settings,
                           open_order_count=open_order_count)
     limits = effective_limits(settings)
@@ -148,16 +207,41 @@ def place_confirmed_order(
     confirm: bool,
     portfolio_ctx: dict,
     settings: dict | None,
+    open_order_count: int | None = None,
 ) -> dict:
-    """Place a sandbox order — only with fresh risk check + confirm=True."""
+    """Place an order — with a fresh risk check + confirm=True.
+
+    Venue comes from the §5.1 connection mode: a ``SANDBOX`` preview needs a
+    sandbox client, a ``PRODUCTION`` preview needs ``live_trading``. A
+    read-only mode can never get here, because ``post_order`` refuses first.
+
+    ``open_order_count`` is part of that fresh check (§6.3): both callers
+    read the open orders right before calling, but the value was previously
+    dropped, so ``max_open_orders`` was enforced only by the preview — the
+    authoritative gate ran with 0. When it is omitted the count is re-read
+    here; when that read fails the order is refused rather than placed
+    unchecked.
+    """
     from tinvest.orders import post_order  # root package, absolute import
 
     if not confirm:
         return {"placed": False, "reason": "confirmation required (§6.2 step 9)"}
-    if preview.get("environment") != "SANDBOX":
-        return {"placed": False, "reason": "only SANDBOX previews can be placed"}
+    want_env = preview.get("environment")
+    have_env = getattr(client, "environment", "SANDBOX")
+    if want_env != have_env:
+        return {"placed": False, "reason":
+                f"preview environment {want_env} does not match client {have_env}"}
+    if open_order_count is None:
+        try:
+            from tinvest.orders import list_orders
+
+            open_order_count = len(list_orders(client, account_id))
+        except Exception as exc:  # noqa: BLE001 — fail closed, report why
+            return {"placed": False, "reason":
+                    f"не удалось перечитать открытые заявки: {exc}"}
     prop = preview.get("proposal") or {}
-    risk = check_proposal(prop, portfolio_ctx, settings)
+    risk = check_proposal(prop, portfolio_ctx, settings,
+                          open_order_count=int(open_order_count))
     if not risk.allowed:
         return {"placed": False, "reason": "risk check failed on fresh state",
                 "violations": risk.violations}
@@ -166,7 +250,9 @@ def place_confirmed_order(
     result = post_order(
         client,
         account_id=account_id,
-        figi=prop.get("figi") or _figi_for(prop.get("ticker")),
+        figi=prop.get("figi") or _figi_for(client, prop.get("ticker"),
+                                           isin=(preview.get("instrument")
+                                                 or {}).get("isin")),
         direction=prop["side"],
         quantity_lots=int(prop["lots"]),
         order_type=prop.get("order_type", "market"),
@@ -179,10 +265,12 @@ def place_confirmed_order(
     return result
 
 
-def _figi_for(ticker: str | None) -> str:
+def _figi_for(client, ticker: str | None, isin: str | None = None) -> str:
     if not ticker:
         raise ValueError("ticker required")
-    return resolve_instrument(ticker).secid
+    from tinvest.instruments import find_instrument_ref
+
+    return find_instrument_ref(client, ticker, isin=isin)["figi"]
 
 
 def track_order(client, account_id: str, order_id: str) -> dict:

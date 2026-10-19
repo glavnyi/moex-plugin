@@ -59,13 +59,14 @@ def _source_status(src: SourceDef, *, status: str, detail: str = "",
 
 
 def _fetch_one(src: SourceDef, *, since: datetime, until: datetime,
-               limit: int) -> list[NewsItem]:
+               limit: int, instrument=None) -> list[NewsItem]:
     if src.kind in {"rss", "moex-rss"}:
         return RssAdapter(src).fetch(since=since, until=until, limit=limit)
     if src.kind == "tinvest-mcp":
         from tinvest.mcp_adapter import fetch_market_news  # lazy: optional
 
-        return fetch_market_news(since=since, until=until, limit=limit, source=src)
+        return fetch_market_news(since=since, until=until, limit=limit,
+                                 source=src, instrument=instrument)
     raise AdapterError(f"{src.id}: unknown adapter kind {src.kind!r}")
 
 
@@ -84,7 +85,14 @@ def fetch_all(
 
     statuses: list[SourceStatus] = []
     items: list[NewsItem] = []
-    per_source_limit = max(10, int(limit // max(1, len(SOURCE_REGISTRY))) + 10)
+    # Fetch depth follows the *window*, not the output budget: splitting
+    # `limit` across every registered source yielded ~13 headlines per
+    # source (a couple of hours), so issuer news older than that never
+    # reached link_items() and every ticker query came back empty —
+    # "No news found for SBER between 2026-10-10 and 2026-10-17".
+    # Floor 100 so a short window still gets a full day of a high-volume
+    # wire; ceiling 180 because the T-Invest MCP rejects limit >= 200.
+    per_source_limit = max(100, min(180, int(days) * 25))
 
     for src in SOURCE_REGISTRY:
         if categories and src.category not in categories:
@@ -97,7 +105,8 @@ def fetch_all(
             continue
         try:
             fetched = _fetch_one(
-                src, since=since, until=until, limit=per_source_limit
+                src, since=since, until=until, limit=per_source_limit,
+                instrument=instrument,
             )
             items.extend(fetched)
             statuses.append(_source_status(src, status="ok", items=len(fetched)))
@@ -119,4 +128,15 @@ def fetch_all(
         key=lambda x: (x.published_at is None, x.published_at or x.fetched_at),
         reverse=True,
     )
-    return AggregatedNews(items=deduped[: int(limit)], statuses=statuses)
+    cap = max(0, int(limit))
+    if instrument is None:
+        deduped = deduped[:cap]
+    else:
+        # Ticker queries are rendered by news_report(linked=True), which
+        # shows only the instrument's own items — so those must claim the
+        # cap before any filler, otherwise issuer news older than the
+        # newest `limit` headlines is dropped after having been fetched.
+        linked = [i for i in deduped if i.tickers]
+        rest = [i for i in deduped if not i.tickers]
+        deduped = (linked + rest)[:cap]
+    return AggregatedNews(items=deduped, statuses=statuses)

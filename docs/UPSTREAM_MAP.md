@@ -4,7 +4,7 @@
 
 | Проект | Commit | Версия | Статус |
 |---|---|---|---|
-| tauricresearch/tradingagents | `1394a3f72aa4393e1a98f51b382434c4b4c2d972` | v0.6.0 | supported |
+| tauricresearch/tradingagents | `e8f5503e9b86d5c2710b0c76b1f686703968c9df` | v0.7.0 | supported |
 | TheLocalLab/TradingAgents-GUI | `774a0fa2aa3ee576d993ab2389e661a44ac9c37b` | — | supported |
 
 Источник истины: `patches/manifest.yaml` + `integration/version_check.py::PINNED`.
@@ -16,9 +16,9 @@
   (editable-install ставит именно её — `import tradingagents` указывает туда).
   Точки интеграции: `dataflows/interface.py` (`VENDOR_METHODS`, `route_to_vendor`,
   `TOOLS_CATEGORIES`), `dataflows/config.py` (`set_config`/`get_config`).
-- **Standalone v0.6.0**: `upstream/tradingagents/tradingagents`, тот же механизм в
+- **Standalone v0.7.0**: `upstream/tradingagents/tradingagents`, тот же механизм в
   `dataflows/router.py` + `dataflows/config.py`.
-- Копии различаются (GUI-версия 0.2.5+gui.2 против v0.6.0), поэтому адаптеры
+- Копии различаются (GUI-версия 0.2.5+gui.2 против v0.7.0), поэтому адаптеры
   динамически определяют, какая копия импортирована.
 
 ## Точки интеграции

@@ -8,6 +8,7 @@ context immediately before placement — never cached from analysis time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 DEFAULT_RISK = {
@@ -69,6 +70,34 @@ def _position_value(ctx: dict, ticker: str) -> float:
     return 0.0
 
 
+def _daily_realized_pnl() -> float:
+    """Realized PnL (RUB) for the current Moscow trading day.
+
+    Source: closed-deal lessons (§11) — each carries ``realized_pnl`` for a
+    completed round-trip. Summing today's entries gives the day's realized
+    result. Lazy import avoids a circular dependency (analytics imports
+    risk checks). Returns 0.0 when no lessons exist yet.
+    """
+    try:
+        from ..analytics import load_lessons
+    except Exception:  # noqa: BLE001 — analytics unavailable → no data
+        return 0.0
+    msk = timezone(timedelta(hours=3))
+    today = datetime.now(msk).date()
+    total = 0.0
+    for lesson in load_lessons(enabled_only=False):
+        pnl = lesson.get("realized_pnl")
+        if pnl is None:
+            continue
+        created = lesson.get("created_at") or ""
+        try:
+            if datetime.fromisoformat(str(created)).astimezone(msk).date() == today:
+                total += float(pnl)
+        except (ValueError, TypeError):
+            continue
+    return round(total, 2)
+
+
 def check_proposal(
     proposal: dict,
     portfolio_ctx: dict,
@@ -93,10 +122,28 @@ def check_proposal(
         result.warnings.append("hold — бронирование не требуется")
         return result
 
-    if portfolio_ctx.get("sandbox") is False:
+    if amount <= 0:
+        # §6.3 states every limit in money. A proposal with no price (a
+        # market order whose quote is missing) yields amount 0, and `if amount
+        # and …` below would then check *nothing* — a live bug: a market buy
+        # came back allowed with zero limits evaluated. Unknown amount blocks.
         result.violations.append(
-            "торговый контекст не песочница — операция запрещена (§6.5)"
+            "сумма заявки неизвестна (нет цены инструмента) — лимиты §6.3 "
+            "проверить нельзя, заявка отклонена"
         )
+
+    if portfolio_ctx.get("sandbox") is False:
+        # §5.1: a production context is only tradeable when the connection
+        # mode itself says so — and that mode had to be set with
+        # confirm_live, so nothing here can widen it. `automation_sandbox_only`
+        # is deliberately *not* consulted: it scopes automation (§13), not the
+        # venue, and is enforced by the auto-trading gates.
+        mode = str(((settings or {}).get("tinvest") or {}).get("mode") or "").lower()
+        if mode != "live_trading":
+            result.violations.append(
+                f"боевой торговый контекст при tinvest.mode={mode or '(не задан)'} — "
+                "для реальных заявок нужен режим live_trading (§5.1)"
+            )
 
     allowed_list = [str(x).upper() for x in limits.get("allowed_instruments") or []]
     if allowed_list and ticker and ticker not in allowed_list:
@@ -161,10 +208,18 @@ def check_proposal(
             )
 
     if limits.get("daily_loss_limit") is not None:
-        result.warnings.append(
-            "дневной лимит потерь задан, но не рассчитывается автоматически "
-            "(нет надёжного источника PnL за день) — проверяется вручную"
-        )
+        realized = _daily_realized_pnl()
+        limit = abs(float(limits["daily_loss_limit"]))
+        if realized <= -limit:
+            result.violations.append(
+                f"дневной лимит потерь превышен: realized {realized:.2f} RUB "
+                f"при лимите -{limit:.2f} (§6.3)"
+            )
+        else:
+            result.warnings.append(
+                f"дневной realized PnL: {realized:.2f} RUB "
+                f"(лимит потерь -{limit:.2f})"
+            )
 
     result.allowed = not result.violations
     result.sized = dict(proposal)

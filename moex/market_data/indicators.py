@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,6 +93,14 @@ INDICATOR_DOCS: dict[str, str] = {
 }
 
 _CACHE_YEARS = 5
+# The cache file is named after *today*, so it is written on the first call
+# of the day and then reused until midnight. Written before the open — live
+# bug: 08:11 on Saturday 2026-10-17, i.e. before the 09:50 ДСВД session —
+# every RSI/MACD/SMA the analyst saw all day lacked the current bar and the
+# report claimed "N/A: Not a trading day (weekend or holiday)" for a day the
+# exchange was trading and had a candle for. Same order as the autotrade
+# tick (300 s), so a cycle reuses the cache but a session never stays stale.
+_CACHE_TTL_SECONDS = 600
 
 
 def _cache_dir() -> Path:
@@ -113,11 +122,20 @@ def _safe(symbol: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(symbol))[:64]
 
 
+def _cache_fresh(path: Path) -> bool:
+    try:
+        return (time.time() - path.stat().st_mtime) < _CACHE_TTL_SECONDS
+    except OSError:
+        return False
+
+
 def load_ohlcv(symbol: str, curr_date: str, *, market=None, board=None) -> pd.DataFrame:
     """MOEX OHLCV up to ``curr_date`` (inclusive), cached per symbol.
 
     Rows after ``curr_date`` are dropped so backtests and historical runs
-    never see future prices.
+    never see future prices. A cache older than ``_CACHE_TTL_SECONDS`` is
+    refreshed; if the refresh fails, the stale bars are served instead of
+    raising — a slightly old close beats no answer at all.
     """
     curr_ts = pd.to_datetime(curr_date)
     today = pd.Timestamp.today().normalize()
@@ -131,22 +149,34 @@ def load_ohlcv(symbol: str, curr_date: str, *, market=None, board=None) -> pd.Da
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{_safe(symbol)}-MOEX-data-{start_str}-{end_str}.csv"
 
+    cached = pd.DataFrame()
     if cache_file.exists():
         try:
-            data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+            cached = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
         except (OSError, ValueError):
-            data = pd.DataFrame()
-    else:
-        data = pd.DataFrame()
+            cached = pd.DataFrame()
+
+    data = cached if (not cached.empty and _cache_fresh(cache_file)) else pd.DataFrame()
 
     if data.empty:
-        data = get_candles(symbol, start_str, end_str, interval="1d",
-                           market=market, board=board)
-        if data.empty:
-            raise ValueError(
-                f"No MOEX candle history for '{symbol}' between {start_str} and {end_str}"
-            )
-        data.to_csv(cache_file, index=False, encoding="utf-8")
+        try:
+            fetched = get_candles(symbol, start_str, end_str, interval="1d",
+                                  market=market, board=board)
+        except Exception as exc:
+            if cached.empty:
+                raise
+            logger.warning("candle refresh failed for %s (%s); serving cached bars",
+                           symbol, exc)
+            fetched = pd.DataFrame()
+        if fetched.empty:
+            if cached.empty:
+                raise ValueError(
+                    f"No MOEX candle history for '{symbol}' between {start_str} and {end_str}"
+                )
+            data = cached
+        else:
+            data = fetched
+            data.to_csv(cache_file, index=False, encoding="utf-8")
 
     data = data.copy()
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")

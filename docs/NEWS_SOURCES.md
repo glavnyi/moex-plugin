@@ -48,6 +48,25 @@ tinvest-news.
 Не обходили платный доступ, CAPTCHA и антибот — источник честно помечен
 `available=false` с текстом причины и не участвует в выдаче.
 
+## Настроения (sentiment-аналитик)
+
+Промпт sentiment-аналитика собирается под активный рынок (`_active_market()`
+читает `market` из run-конфига):
+
+- новости подписаны фактическим источником — `MOEX (ISS and exchange RSS
+  feeds)`, а не `Yahoo Finance`;
+- блоки StockTwits и Reddit помечены `not applicable to MOEX-quoted
+  instruments`: StockTwits индексирует только US-каштеги, а сабреддиты не
+  покрывают MOEX-тикеров — оба фетчера всегда отвечают 403/пусто;
+- инструкции не требуют «StockTwits Bullish/Bearish ratio» и прямо запрещают
+  выдумывать розничные настроения; вместо сверки с соцсетями — сверка новостей
+  с ценой и оборотом из отчёта Market Analyst.
+
+Реализация: `tradingagents/agents/analysts/sentiment_analyst.py` (входит в
+`patches/tradingagents-gui/0001-moex-extension.patch`), тесты —
+`tests/unit/test_sentiment_market_prompt.py`. Для не-MOEX рынков текст
+побайтно совпадает с апстримом.
+
 ## Модель и обработка
 
 - `NewsItem`: id, source_id/name, title, summary, url, published_at (UTC),

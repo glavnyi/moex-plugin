@@ -1,4 +1,4 @@
-"""Register MOEX vendors into a standalone TradingAgents v0.6.0 install.
+"""Register MOEX vendors into a standalone TradingAgents v0.7.0 install.
 
 Standalone keeps the same ``VENDOR_METHODS``/``route_to_vendor``
 dispatch, but inside ``tradingagents.dataflows.router``. The impls are
